@@ -5,6 +5,8 @@ Handles private-key loading/validation, S/MIME detection, openssl-based
 decryption, multi-key chain fallback, and message reconstruction.
 """
 
+from __future__ import annotations
+
 import email
 import email.parser
 import email.policy
@@ -13,20 +15,21 @@ import os
 import subprocess
 import sys
 import tempfile
+from itertools import chain
 
 
 # ---------------------------------------------------------------------------
 # S/MIME detection
 # ---------------------------------------------------------------------------
 
-def is_smime_encrypted(header_bytes):
+def is_smime_encrypted(header_bytes: bytes) -> bool:
     """
     Determine if a message is S/MIME encrypted by examining its Content-Type.
 
     Returns True if Content-Type is application/pkcs7-mime or
     application/x-pkcs7-mime with smime-type=enveloped-data (or smime-type absent).
     """
-    parser = email.parser.BytesParser(policy=email.policy.compat32)
+    parser = email.parser.BytesParser(policy=email.policy.default)
     msg = parser.parsebytes(header_bytes, headersonly=True)
     content_type = msg.get_content_type()
     if content_type not in ("application/pkcs7-mime", "application/x-pkcs7-mime"):
@@ -41,12 +44,12 @@ def is_smime_encrypted(header_bytes):
     return False
 
 
-def extract_message_info(header_bytes):
+def extract_message_info(header_bytes: bytes) -> dict[str, str]:
     """
     Extract identifying information from message headers for error reporting.
     Returns a dict with 'date', 'subject', 'from' keys.
     """
-    parser = email.parser.BytesParser(policy=email.policy.compat32)
+    parser = email.parser.BytesParser(policy=email.policy.default)
     msg = parser.parsebytes(header_bytes, headersonly=True)
     return {
         "date": msg.get("Date", "<no date>"),
@@ -55,7 +58,7 @@ def extract_message_info(header_bytes):
     }
 
 
-def format_message_id(uid, info):
+def format_message_id(uid: str, info: dict[str, str]) -> str:
     """Format a human-readable message identifier string."""
     return (
         f"UID {uid} | From: {info['from']} | "
@@ -67,7 +70,7 @@ def format_message_id(uid, info):
 # Key loading
 # ---------------------------------------------------------------------------
 
-def load_private_key(key_path, passphrase=""):
+def load_private_key(key_path: str, passphrase: str = ""):
     """
     Load and validate a PEM private key. Tries loading without a passphrase
     first (for unencrypted keys). If that fails and a passphrase is available,
@@ -145,7 +148,7 @@ def load_key_chain(args):
 # Decryption
 # ---------------------------------------------------------------------------
 
-def decrypt_smime_message(raw_message, key_path, passphrase):
+def decrypt_smime_message(raw_message: bytes, key_path: str, passphrase: str) -> bytes:
     """
     Decrypt an S/MIME encrypted message.
 
@@ -155,14 +158,13 @@ def decrypt_smime_message(raw_message, key_path, passphrase):
     Returns the decrypted message bytes on success.
     Raises an exception on failure.
     """
-    with tempfile.NamedTemporaryFile(suffix=".eml", delete=False) as msg_file:
-        msg_file.write(raw_message)
-        msg_path = msg_file.name
+    with tempfile.TemporaryDirectory() as tmpdir:
+        msg_path = os.path.join(tmpdir, "input.eml")
+        out_path = os.path.join(tmpdir, "output.eml")
 
-    with tempfile.NamedTemporaryFile(suffix=".eml", delete=False) as out_file:
-        out_path = out_file.name
+        with open(msg_path, "wb") as f:
+            f.write(raw_message)
 
-    try:
         cmd = [
             "openssl", "cms", "-decrypt",
             "-inkey", key_path,
@@ -173,29 +175,16 @@ def decrypt_smime_message(raw_message, key_path, passphrase):
         if passphrase:
             cmd.extend(["-passin", f"pass:{passphrase}"])
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=60,
-        )
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"openssl cms -decrypt failed: {stderr}")
 
         with open(out_path, "rb") as f:
             return f.read()
-    finally:
-        try:
-            os.unlink(msg_path)
-        except OSError:
-            pass
-        try:
-            os.unlink(out_path)
-        except OSError:
-            pass
 
 
-def decrypt_with_key_chain(raw_message, keys):
+def decrypt_with_key_chain(raw_message: bytes, keys: list) -> bytes:
     """
     Attempt decryption with each key in *keys* (a list of (path, passphrase)
     tuples). Returns decrypted bytes on the first success.
@@ -232,7 +221,56 @@ def decrypt_with_key_chain(raw_message, keys):
 # Message reconstruction
 # ---------------------------------------------------------------------------
 
-def reconstruct_message(original_raw, decrypted_inner):
+# Headers to preserve from the original encrypted message envelope
+# These are transport/envelope headers that won't be in the inner message
+ENVELOPE_HEADERS = [
+    "Return-Path",
+    "Received",
+    "DKIM-Signature",
+    "ARC-Seal",
+    "ARC-Message-Signature",
+    "ARC-Authentication-Results",
+    "Authentication-Results",
+    "Delivered-To",
+    "X-Original-To",
+]
+
+# Headers from the original that should override the decrypted message
+# (these are the canonical envelope headers)
+OVERRIDE_HEADERS = [
+    "From",
+    "To",
+    "Cc",
+    "Bcc",
+    "Date",
+    "Subject",
+    "Message-ID",
+    "Message-Id",
+    "In-Reply-To",
+    "References",
+    "Reply-To",
+    "Sender",
+    "List-Id",
+    "List-Unsubscribe",
+    "List-Archive",
+    "List-Post",
+    "List-Help",
+    "Precedence",
+    "X-Mailer",
+    "User-Agent",
+    "X-Priority",
+    "Importance",
+    "X-Spam-Status",
+    "X-Spam-Score",
+    "X-Spam-Flag",
+]
+
+# Pre-computed lowercase sets for O(1) membership tests
+_ENVELOPE_LOWER = frozenset(h.lower() for h in ENVELOPE_HEADERS)
+_OVERRIDE_LOWER = frozenset(h.lower() for h in OVERRIDE_HEADERS)
+
+
+def reconstruct_message(original_raw: bytes, decrypted_inner: bytes) -> bytes:
     """
     Reconstruct the message: preserve original envelope headers (From, To,
     Date, Subject, Message-ID, etc.) and replace the encrypted body with
@@ -246,103 +284,43 @@ def reconstruct_message(original_raw, decrypted_inner):
     original_msg = parser.parsebytes(original_raw)
     decrypted_msg = parser.parsebytes(decrypted_inner)
 
-    # Headers to preserve from the original encrypted message envelope
-    # These are transport/envelope headers that won't be in the inner message
-    ENVELOPE_HEADERS = [
-        "Return-Path",
-        "Received",
-        "DKIM-Signature",
-        "ARC-Seal",
-        "ARC-Message-Signature",
-        "ARC-Authentication-Results",
-        "Authentication-Results",
-        "Delivered-To",
-        "X-Original-To",
+    # Collect envelope headers from original (transport headers)
+    envelope_parts = [
+        (hdr, val)
+        for hdr in ENVELOPE_HEADERS
+        for val in original_msg.get_all(hdr, [])
     ]
-
-    # Headers from the original that should override the decrypted message
-    # (these are the canonical envelope headers)
-    OVERRIDE_HEADERS = [
-        "From",
-        "To",
-        "Cc",
-        "Bcc",
-        "Date",
-        "Subject",
-        "Message-ID",
-        "Message-Id",
-        "In-Reply-To",
-        "References",
-        "Reply-To",
-        "Sender",
-        "List-Id",
-        "List-Unsubscribe",
-        "List-Archive",
-        "List-Post",
-        "List-Help",
-        "Precedence",
-        "X-Mailer",
-        "User-Agent",
-        "X-Priority",
-        "Importance",
-        "X-Spam-Status",
-        "X-Spam-Score",
-        "X-Spam-Flag",
-    ]
-
-    # Build the new message starting with the decrypted content structure
-    # First, collect envelope headers from original that should be prepended
-    envelope_parts = []
-    for hdr in ENVELOPE_HEADERS:
-        values = original_msg.get_all(hdr, [])
-        for val in values:
-            envelope_parts.append((hdr, val))
 
     # Collect override headers from original
-    override_map = {}
-    for hdr in OVERRIDE_HEADERS:
-        values = original_msg.get_all(hdr, [])
-        if values:
-            override_map[hdr.lower()] = [(hdr, v) for v in values]
-
-    # Now build the final message
-    # Strategy: use the decrypted message as the base, but replace/add headers
-    # from the original envelope
+    override_map = {
+        hdr.lower(): [(hdr, v) for v in values]
+        for hdr in OVERRIDE_HEADERS
+        if (values := original_msg.get_all(hdr, []))
+    }
 
     # Remove headers from decrypted that we'll override
     for hdr in OVERRIDE_HEADERS:
         while hdr in decrypted_msg:
             del decrypted_msg[hdr]
 
-    # Add overridden headers at the top
-    # We need to rebuild the message to control header ordering
-    final_lines = []
-
-    # Add envelope headers first (Received, Return-Path, etc.)
-    for hdr_name, hdr_val in envelope_parts:
-        final_lines.append(f"{hdr_name}: {hdr_val}")
-
-    # Add override headers from original
-    for hdr in OVERRIDE_HEADERS:
-        key = hdr.lower()
-        if key in override_map:
-            for hdr_name, hdr_val in override_map[key]:
-                final_lines.append(f"{hdr_name}: {hdr_val}")
-
-    # Add remaining headers from decrypted message (Content-Type, MIME-Version, etc.)
-    for hdr_name in decrypted_msg.keys():
-        if hdr_name.lower() in [h.lower() for h in ENVELOPE_HEADERS]:
-            continue
-        if hdr_name.lower() in [h.lower() for h in OVERRIDE_HEADERS]:
-            continue
-        for val in decrypted_msg.get_all(hdr_name, []):
-            final_lines.append(f"{hdr_name}: {val}")
+    # Assemble all header lines using itertools.chain
+    final_lines = list(chain(
+        # Envelope headers first (Received, Return-Path, etc.)
+        (f"{hdr}: {val}" for hdr, val in envelope_parts),
+        # Override headers from original
+        (f"{hdr}: {val}"
+         for h in OVERRIDE_HEADERS
+         for hdr, val in override_map.get(h.lower(), [])),
+        # Remaining headers from decrypted (Content-Type, MIME-Version, etc.)
+        (f"{name}: {val}"
+         for name in decrypted_msg.keys()
+         if name.lower() not in _ENVELOPE_LOWER | _OVERRIDE_LOWER
+         for val in decrypted_msg.get_all(name, [])),
+    ))
 
     # Get the body from the decrypted message
-    # We need to serialize the body part properly
     if decrypted_msg.is_multipart():
-        # For multipart, we need the full MIME body
-        # Get everything after the headers in the decrypted message
+        # For multipart, get everything after the headers
         decrypted_bytes = decrypted_msg.as_bytes()
         # Split at the blank line separating headers from body
         parts = decrypted_bytes.split(b"\r\n\r\n", 1)
@@ -350,7 +328,6 @@ def reconstruct_message(original_raw, decrypted_inner):
             parts = decrypted_bytes.split(b"\n\n", 1)
         body = parts[1] if len(parts) == 2 else b""
 
-        # Need to include the Content-Type boundary in our headers
         header_block = "\r\n".join(final_lines)
         return header_block.encode("utf-8") + b"\r\n\r\n" + body
     else:

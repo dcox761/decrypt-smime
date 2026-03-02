@@ -5,14 +5,36 @@ Orchestrates scanning folders for encrypted messages, decrypting them
 (optionally in parallel), and replacing originals via IMAP.
 """
 
-import imaplib
+from __future__ import annotations
+
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Callable
+
+from imapclient import IMAPClient
 
 from . import imap as imap_helpers
 from . import crypto
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MessageRecord:
+    """Typed record for a single message being processed."""
+    uid: int
+    flags: list
+    internaldate: object  # datetime or None
+    header: bytes
+    raw_message: bytes | None = None
+    final_message: bytes | None = None
+    error: str | None = None
+    label: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -60,25 +82,16 @@ def reset_global_decrypted():
 
 
 # ---------------------------------------------------------------------------
-# Dataclasses-light: plain dicts for message metadata
-# ---------------------------------------------------------------------------
-# Each "message record" is a dict with keys:
-#   uid, flags, internaldate, header  (from scan phase)
-#   raw_message                       (after full fetch)
-#   decrypted_inner, final_message    (after decrypt/reconstruct)
-#   error                             (if something failed)
-
-
-# ---------------------------------------------------------------------------
 # Scan phase — identify encrypted messages in a folder
 # ---------------------------------------------------------------------------
 
-def scan_folder(conn, folder_name, display_name, readonly=True, debug=False):
+def scan_folder(conn: IMAPClient, folder_name: str, display_name: str,
+                readonly: bool = True, debug: bool = False):
     """
     SELECT *folder_name* and FETCH all message headers.
 
-    Returns ``(msg_count, messages)`` where *messages* is a list of dicts
-    with keys ``uid``, ``flags``, ``internaldate``, ``header``.
+    Returns ``(msg_count, messages)`` where *messages* is a list of
+    :class:`MessageRecord` instances.
 
     Returns ``(0, [])`` if the folder cannot be selected or is empty.
     """
@@ -102,64 +115,49 @@ def scan_folder(conn, folder_name, display_name, readonly=True, debug=False):
 
     dbg("FETCH 1:* (FLAGS INTERNALDATE BODY.PEEK[HEADER])")
     try:
-        status, fetch_data = conn.uid(
-            "FETCH", "1:*", "(FLAGS INTERNALDATE BODY.PEEK[HEADER])"
-        )
-        dbg(f"FETCH headers done, status={status}, "
-            f"items={len(fetch_data) if fetch_data else 0}")
-        if status != "OK":
-            print(f"  WARNING: FETCH failed for folder {display_name}",
-                  file=sys.stderr)
+        fetch_data = conn.fetch("1:*", [b"FLAGS", b"INTERNALDATE",
+                                        b"BODY.PEEK[HEADER]"])
+        dbg(f"FETCH headers done, items={len(fetch_data)}")
+        if not fetch_data:
             return msg_count, []
-    except imaplib.IMAP4.error as exc:
+    except Exception as exc:
         print(f"  WARNING: FETCH error in {display_name}: {exc}",
               file=sys.stderr)
         return msg_count, []
 
-    # Parse fetch results into per-message dicts
-    messages = []
-    i = 0
-    while i < len(fetch_data):
-        item = fetch_data[i]
-        if item is None:
-            i += 1
-            continue
-        if isinstance(item, tuple) and len(item) >= 2:
-            metadata_line = item[0]
-            header_data = item[1]
-            uid = imap_helpers.extract_uid_from_fetch(metadata_line)
-            flags = imap_helpers.extract_flags_from_fetch(metadata_line)
-            internaldate = imap_helpers.extract_internaldate_from_fetch(
-                metadata_line
-            )
-            if uid is not None:
-                messages.append({
-                    "uid": uid,
-                    "flags": flags,
-                    "internaldate": internaldate,
-                    "header": header_data,
-                })
-        i += 1
+    # Parse fetch results into MessageRecord instances via filter+map
+    def _parse_item(uid_data):
+        uid, data = uid_data
+        header = data.get(b"BODY[HEADER]", b"")
+        if not header:
+            return None
+        return MessageRecord(
+            uid=uid,
+            flags=list(data.get(b"FLAGS", ())),
+            internaldate=data.get(b"INTERNALDATE"),
+            header=header,
+        )
 
+    messages = [m for m in map(_parse_item, fetch_data.items()) if m is not None]
     dbg(f"Parsed {len(messages)} messages from fetch data")
     return msg_count, messages
 
 
-def filter_encrypted(messages):
+def filter_encrypted(messages: list[MessageRecord]):
     """
     Filter *messages* to only those that are S/MIME encrypted and not
     already ``\\Deleted``.
 
-    Returns two lists: ``(encrypted, skipped_deleted_count)``.
+    Returns ``(encrypted, skipped_deleted_count)``.
     """
-    encrypted = []
-    deleted_skipped = 0
-    for msg in messages:
-        if "\\Deleted" in msg["flags"]:
-            deleted_skipped += 1
-            continue
-        if crypto.is_smime_encrypted(msg["header"]):
-            encrypted.append(msg)
+    deleted_skipped = sum(
+        1 for m in messages if b"\\Deleted" in m.flags
+    )
+    encrypted = [
+        m for m in messages
+        if b"\\Deleted" not in m.flags
+        and crypto.is_smime_encrypted(m.header)
+    ]
     return encrypted, deleted_skipped
 
 
@@ -167,7 +165,7 @@ def filter_encrypted(messages):
 # Full-message fetch (needed before decryption)
 # ---------------------------------------------------------------------------
 
-def fetch_full_message(conn, uid, debug_fn=None):
+def fetch_full_message(conn: IMAPClient, uid: int, debug_fn=None) -> bytes:
     """
     FETCH the full RFC822 body for *uid*.
 
@@ -175,133 +173,111 @@ def fetch_full_message(conn, uid, debug_fn=None):
     """
     if debug_fn:
         debug_fn(f"FETCH UID {uid} (RFC822)")
-    status, full_data = conn.uid("FETCH", uid, "(RFC822)")
+    fetch_data = conn.fetch([uid], [b"RFC822"])
     if debug_fn:
-        debug_fn(f"FETCH RFC822 done, status={status}, "
-                 f"parts={len(full_data) if full_data else 0}")
-    if status != "OK":
-        raise RuntimeError(f"FETCH RFC822 failed for UID {uid}")
+        debug_fn(f"FETCH RFC822 done, items={len(fetch_data)}")
 
-    for part in full_data:
-        if isinstance(part, tuple) and len(part) >= 2:
-            return part[1]
+    if uid not in fetch_data:
+        raise RuntimeError(f"FETCH RFC822 returned no data for UID {uid}")
 
-    raise RuntimeError(f"Could not extract message body for UID {uid}")
+    body = fetch_data[uid].get(b"RFC822")
+    if body is None:
+        raise RuntimeError(f"Could not extract message body for UID {uid}")
+
+    return body
 
 
 # ---------------------------------------------------------------------------
 # Single-message decrypt + reconstruct (thread-safe, no IMAP)
 # ---------------------------------------------------------------------------
 
-def decrypt_message(msg_record, keys):
+def decrypt_message(msg: MessageRecord, keys: list):
     """
     Decrypt and reconstruct a single message.
 
-    *msg_record* must already have ``raw_message`` populated.
-    On success, sets ``msg_record['final_message']``.
-    On failure, sets ``msg_record['error']``.
+    *msg* must already have ``raw_message`` populated.
+    On success, sets ``msg.final_message``.
+    On failure, sets ``msg.error``.
 
     This function does **no** IMAP I/O and is safe to call from worker
     threads.
     """
     try:
         decrypted_inner = crypto.decrypt_with_key_chain(
-            msg_record["raw_message"], keys
+            msg.raw_message, keys
         )
         final = crypto.reconstruct_message(
-            msg_record["raw_message"], decrypted_inner
+            msg.raw_message, decrypted_inner
         )
-        msg_record["final_message"] = final
-        msg_record["error"] = None
+        msg.final_message = final
+        msg.error = None
     except Exception as exc:
-        msg_record["final_message"] = None
-        msg_record["error"] = str(exc)
+        msg.final_message = None
+        msg.error = str(exc)
 
 
 # ---------------------------------------------------------------------------
 # IMAP replace — APPEND decrypted + STORE \Deleted on original
 # ---------------------------------------------------------------------------
 
-def replace_message(conn, folder_name, msg_record, debug_fn=None):
+def replace_message(conn: IMAPClient, folder_name: str, msg: MessageRecord,
+                    debug_fn=None):
     """
     Replace an encrypted message with its decrypted version via IMAP.
 
-    1. UNSELECT to release dotlocks
+    1. unselect_folder to release dotlocks
     2. APPEND decrypted message with original flags/date
-    3. SELECT folder
-    4. STORE +FLAGS (\\Deleted) on original UID
+    3. select_folder
+    4. add_flags \\Deleted on original UID
 
     Returns None on success or an error string.
     """
-    uid = msg_record["uid"]
-    final_message = msg_record["final_message"]
+    uid = msg.uid
+    final_message = msg.final_message
 
-    # Prepare flags — strip \Deleted and \Recent
-    append_flags = [f for f in msg_record["flags"]
-                    if f.lower() not in ("\\deleted", "\\recent")]
-    flags_str = imap_helpers.format_imap_flags(append_flags)
-    internaldate = msg_record["internaldate"]
-    date_str = f'"{internaldate}"' if internaldate else None
+    # Prepare flags — strip \\Deleted and \\Recent
+    append_flags = imap_helpers.clean_flags(msg.flags)
 
-    # UNSELECT to release Dovecot dotlocks before APPEND
+    # unselect to release Dovecot dotlocks before APPEND
     if debug_fn:
-        debug_fn(f"UNSELECT (release locks before APPEND)")
+        debug_fn("UNSELECT (release locks before APPEND)")
     try:
-        conn.unselect()
-    except (imaplib.IMAP4.error, AttributeError):
+        conn.unselect_folder()
+    except Exception:
         try:
-            conn.close()
-        except imaplib.IMAP4.error:
+            conn.close_folder()
+        except Exception:
             pass
 
     # APPEND decrypted message
     if debug_fn:
-        debug_fn(f"APPEND flags={flags_str} date={date_str} "
+        debug_fn(f"APPEND flags={append_flags} date={msg.internaldate} "
                  f"size={len(final_message)}")
-    appended = False
-    last_err = None
-    for name_variant in (f'"{folder_name}"', folder_name):
-        try:
-            status, resp = conn.append(
-                name_variant, flags_str, date_str, final_message
-            )
-            if debug_fn:
-                debug_fn(f"APPEND status={status} resp={resp}")
-            if status == "OK":
-                appended = True
-                break
-        except imaplib.IMAP4.error as exc:
-            if debug_fn:
-                debug_fn(f"APPEND IMAP4 error: {exc}")
-            last_err = exc
-            continue
-        except Exception as exc:
-            if debug_fn:
-                debug_fn(f"APPEND exception: {exc}")
-            last_err = exc
-            break
-
-    if not appended:
+    try:
+        conn.append(folder_name, final_message,
+                    flags=append_flags, msg_time=msg.internaldate)
+        if debug_fn:
+            debug_fn("APPEND OK")
+    except Exception as exc:
+        if debug_fn:
+            debug_fn(f"APPEND exception: {exc}")
         # Re-SELECT so caller can continue
         imap_helpers.select_folder(conn, folder_name, readonly=False)
-        detail = f": {last_err}" if last_err else ""
-        return f"APPEND failed for UID {uid}{detail}"
+        return f"APPEND failed for UID {uid}: {exc}"
 
     # Re-SELECT for STORE
     if debug_fn:
         debug_fn(f"SELECT {folder_name} (for STORE)")
     imap_helpers.select_folder(conn, folder_name, readonly=False)
 
-    # Mark original as \Deleted
+    # Mark original as \\Deleted
     if debug_fn:
         debug_fn(f"STORE UID {uid} +FLAGS (\\Deleted)")
     try:
-        status, resp = conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+        conn.add_flags([uid], [b"\\Deleted"])
         if debug_fn:
-            debug_fn(f"STORE status={status} resp={resp}")
-        if status != "OK":
-            return f"STORE \\Deleted failed for UID {uid}"
-    except imaplib.IMAP4.error as exc:
+            debug_fn("STORE OK")
+    except Exception as exc:
         return f"STORE \\Deleted error for UID {uid}: {exc}"
 
     return None  # success
@@ -311,8 +287,9 @@ def replace_message(conn, folder_name, msg_record, debug_fn=None):
 # Move to .failed folder
 # ---------------------------------------------------------------------------
 
-def move_message_to_failed(conn, folder_name, uid, raw_message,
-                           flags_list, internaldate):
+def move_message_to_failed(conn: IMAPClient, folder_name: str, uid: int,
+                           raw_message: bytes, flags_list: list,
+                           internaldate):
     """
     Move a message to the .failed sibling folder by APPENDing it there and
     marking the original as \\Deleted.
@@ -322,35 +299,24 @@ def move_message_to_failed(conn, folder_name, uid, raw_message,
     failed_folder = folder_name + ".failed"
     imap_helpers.ensure_folder_exists(conn, failed_folder)
 
-    # Strip \Recent
-    clean_flags = [f for f in flags_list if f.lower() != "\\recent"]
-    flags_str = imap_helpers.format_imap_flags(clean_flags)
+    # Strip \\Recent only (keep \\Deleted status from original for .failed)
+    clean = imap_helpers.clean_flags(flags_list, exclude={"\\recent"})
 
-    # UNSELECT to release dotlocks
+    # unselect to release dotlocks
     try:
-        conn.unselect()
-    except (imaplib.IMAP4.error, AttributeError):
+        conn.unselect_folder()
+    except Exception:
         try:
-            conn.close()
-        except imaplib.IMAP4.error:
+            conn.close_folder()
+        except Exception:
             pass
 
     # APPEND to .failed folder
-    date_str = f'"{internaldate}"' if internaldate else None
-    appended = False
-    for name_variant in (f'"{failed_folder}"', failed_folder):
-        try:
-            status, _ = conn.append(
-                name_variant, flags_str, date_str, raw_message
-            )
-            if status == "OK":
-                appended = True
-                break
-        except imaplib.IMAP4.error:
-            continue
-
-    if not appended:
-        return f"APPEND to {failed_folder} failed for UID {uid}"
+    try:
+        conn.append(failed_folder, raw_message,
+                    flags=clean, msg_time=internaldate)
+    except Exception as exc:
+        return f"APPEND to {failed_folder} failed for UID {uid}: {exc}"
 
     # Re-SELECT original folder to mark as deleted
     msg_count = imap_helpers.select_folder(conn, folder_name, readonly=False)
@@ -358,22 +324,111 @@ def move_message_to_failed(conn, folder_name, uid, raw_message,
         return f"Could not re-select {folder_name} to delete UID {uid}"
 
     try:
-        status, _ = conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
-        if status != "OK":
-            return f"STORE \\Deleted failed for UID {uid} in {folder_name}"
-    except imaplib.IMAP4.error as exc:
+        conn.add_flags([uid], [b"\\Deleted"])
+    except Exception as exc:
         return f"STORE \\Deleted error for UID {uid}: {exc}"
 
     return None
 
 
 # ---------------------------------------------------------------------------
+# Shared error / outcome handler
+# ---------------------------------------------------------------------------
+
+def _handle_message_outcome(
+    msg: MessageRecord,
+    conn: IMAPClient,
+    folder_name: str,
+    dryrun: bool,
+    ignore_failures: bool,
+    move_failures: bool,
+    errors: list[str],
+    dbg: Callable,
+    quiet_progress: bool,
+    on_message_decrypted: Callable | None,
+    counters: dict,
+):
+    """
+    Handle the outcome of a decrypted (or failed) message.
+
+    Mutates *counters* (keys: ``decrypted``, ``failed``, ``processed``),
+    appends to *errors*.
+
+    Returns ``(continue_ok: bool, fatal_error: str | None)``.
+    ``continue_ok=True`` means processing should continue.
+    ``continue_ok=False`` means a fatal error occurred.
+    """
+    uid = msg.uid
+    msg_label = msg.label or f"UID {uid}"
+
+    # --- Decryption failure ---
+    if msg.error:
+        error_msg = f"Decryption failed: {msg_label}: {msg.error}"
+        if ignore_failures or move_failures:
+            print(f"    ERROR: {error_msg}", file=sys.stderr)
+            errors.append(error_msg)
+            counters["failed"] += 1
+
+            if move_failures and not dryrun:
+                move_err = move_message_to_failed(
+                    conn, folder_name, uid, msg.raw_message,
+                    msg.flags, msg.internaldate,
+                )
+                if move_err:
+                    print(f"    WARNING: {move_err}", file=sys.stderr)
+                    errors.append(move_err)
+                else:
+                    print(f"    Moved to {folder_name}.failed")
+                imap_helpers.select_folder(
+                    conn, folder_name, readonly=False
+                )
+            elif move_failures and dryrun:
+                print(f"    Would move to {folder_name}.failed (dryrun)")
+            return True, None
+        return False, error_msg
+
+    # --- Decryption success ---
+    counters["decrypted"] += 1
+    _increment_global_decrypted()
+    if on_message_decrypted is not None:
+        on_message_decrypted()
+    counters["processed"] += 1
+
+    if dryrun:
+        if not quiet_progress:
+            print(f"    UID {uid}: decryption OK (dryrun, not replacing)")
+        return True, None
+
+    # Replace via IMAP
+    err = replace_message(conn, folder_name, msg, dbg)
+    if err:
+        error_msg = f"{err}: {msg_label}"
+        if ignore_failures:
+            print(f"    WARNING: {error_msg}", file=sys.stderr)
+            errors.append(error_msg)
+            counters["failed"] += 1
+            return True, None
+        return False, error_msg
+
+    if not quiet_progress:
+        print(f"    UID {uid}: decrypted and replaced")
+    dbg(f"Done with UID {uid}")
+
+    # Free memory
+    msg.raw_message = None
+    msg.final_message = None
+    return True, None
+
+
+# ---------------------------------------------------------------------------
 # Folder-level orchestrator
 # ---------------------------------------------------------------------------
 
-def process_folder(conn, folder_name, display_name, keys,
-                   count_only, dryrun, ignore_failures, move_failures,
-                   debug=False, workers=1, quiet_progress=False,
+def process_folder(conn: IMAPClient, folder_name: str, display_name: str,
+                   keys: list, count_only: bool, dryrun: bool,
+                   ignore_failures: bool, move_failures: bool,
+                   debug: bool = False, workers: int = 1,
+                   quiet_progress: bool = False,
                    on_decrypt_start=None, on_scan_complete=None,
                    on_message_decrypted=None):
     """
@@ -448,12 +503,12 @@ def process_folder(conn, folder_name, display_name, keys,
             on_message_decrypted=on_message_decrypted,
         )
 
-    # Expunge \Deleted messages at end of folder
+    # Expunge \\Deleted messages at end of folder
     if decrypted_count > 0 and not dryrun and not count_only:
         dbg("CLOSE (expunge all \\Deleted messages)")
         try:
-            conn.close()
-        except imaplib.IMAP4.error:
+            conn.close_folder()
+        except Exception:
             pass
 
     elapsed = time.time() - _t0
@@ -468,8 +523,7 @@ def _process_sequential(conn, folder_name, encrypted_msgs, keys,
                         dryrun, ignore_failures, move_failures, dbg,
                         quiet_progress=False, on_message_decrypted=None):
     """Process encrypted messages one at a time. Returns (decrypted, failed, errors)."""
-    decrypted_count = 0
-    failed_count = 0
+    counters = {"decrypted": 0, "failed": 0, "processed": 0}
     errors = []
 
     for idx, msg in enumerate(encrypted_msgs, 1):
@@ -479,82 +533,40 @@ def _process_sequential(conn, folder_name, encrypted_msgs, keys,
                       file=sys.stderr)
             break
 
-        uid = msg["uid"]
-        msg_id_info = crypto.extract_message_info(msg["header"])
-        msg_label = crypto.format_message_id(uid, msg_id_info)
+        uid = msg.uid
+        msg_id_info = crypto.extract_message_info(msg.header)
+        msg.label = crypto.format_message_id(str(uid), msg_id_info)
         dbg(f"[{idx}] Processing UID {uid}")
 
         # Fetch full message
         try:
-            msg["raw_message"] = fetch_full_message(conn, uid, dbg)
+            msg.raw_message = fetch_full_message(conn, uid, dbg)
         except Exception as exc:
-            error_msg = f"Fetch failed: {msg_label}: {exc}"
+            error_msg = f"Fetch failed: {msg.label}: {exc}"
             if ignore_failures:
                 print(f"    WARNING: {error_msg}", file=sys.stderr)
                 errors.append(error_msg)
-                failed_count += 1
+                counters["failed"] += 1
                 continue
-            return decrypted_count, failed_count, [error_msg]
+            return counters["decrypted"], counters["failed"], [error_msg]
 
-        dbg(f"[{idx}] Message size: {len(msg['raw_message'])} bytes")
+        dbg(f"[{idx}] Message size: {len(msg.raw_message)} bytes")
 
         # Decrypt + reconstruct
         dbg(f"[{idx}] Decrypting with {len(keys)} key(s)")
         decrypt_message(msg, keys)
 
-        if msg["error"]:
-            error_msg = f"Decryption failed: {msg_label}: {msg['error']}"
-            if ignore_failures or move_failures:
-                print(f"    ERROR: {error_msg}", file=sys.stderr)
-                errors.append(error_msg)
-                failed_count += 1
+        ok, fatal = _handle_message_outcome(
+            msg, conn, folder_name, dryrun, ignore_failures,
+            move_failures, errors, dbg, quiet_progress,
+            on_message_decrypted, counters,
+        )
+        if not ok:
+            return counters["decrypted"], counters["failed"], [fatal]
 
-                if move_failures and not dryrun:
-                    move_err = move_message_to_failed(
-                        conn, folder_name, uid, msg["raw_message"],
-                        msg["flags"], msg["internaldate"],
-                    )
-                    if move_err:
-                        print(f"    WARNING: {move_err}", file=sys.stderr)
-                        errors.append(move_err)
-                    else:
-                        print(f"    Moved to {folder_name}.failed")
-                    imap_helpers.select_folder(
-                        conn, folder_name, readonly=False
-                    )
-                elif move_failures and dryrun:
-                    print(f"    Would move to {folder_name}.failed (dryrun)")
-                continue
-            return decrypted_count, failed_count, [error_msg]
-
-        dbg(f"[{idx}] Decrypted OK, final size: "
-            f"{len(msg['final_message'])} bytes")
-        decrypted_count += 1
-        _increment_global_decrypted()
-        if on_message_decrypted is not None:
-            on_message_decrypted()
-
-        if dryrun:
-            if not quiet_progress:
-                print(f"    UID {uid}: decryption OK (dryrun, not replacing)")
-            continue
-
-        # Replace via IMAP
-        err = replace_message(conn, folder_name, msg, dbg)
-        if err:
-            error_msg = f"{err}: {msg_label}"
-            if ignore_failures:
-                print(f"    WARNING: {error_msg}", file=sys.stderr)
-                errors.append(error_msg)
-                failed_count += 1
-                continue
-            return decrypted_count, failed_count, [error_msg]
-
-        if not quiet_progress:
-            print(f"    UID {uid}: decrypted and replaced")
         dbg(f"[{idx}] Done with UID {uid}")
 
-    return decrypted_count, failed_count, errors
+    return counters["decrypted"], counters["failed"], errors
 
 
 # ---------------------------------------------------------------------------
@@ -573,17 +585,9 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
     up to *workers* openssl decrypt operations run in parallel.
     Memory is bounded to ~workers in-flight messages.
 
-    Pipeline:
-      1. Fetch a message (IMAP, main thread)
-      2. Submit to thread pool for decryption
-      3. If pool is full or any futures are done, collect results and
-         do IMAP replace for completed messages
-      4. Repeat until all messages processed
-
     Returns ``(decrypted, failed, errors)``.
     """
-    decrypted_count = 0
-    failed_count = 0
+    counters = {"decrypted": 0, "failed": 0, "processed": 0}
     errors = []
     total = len(encrypted_msgs)
 
@@ -593,86 +597,31 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
 
     # Pre-compute labels (cheap — only header parsing)
     for msg in encrypted_msgs:
-        msg_id_info = crypto.extract_message_info(msg["header"])
-        msg["_label"] = crypto.format_message_id(msg["uid"], msg_id_info)
+        msg_id_info = crypto.extract_message_info(msg.header)
+        msg.label = crypto.format_message_id(str(msg.uid), msg_id_info)
 
-    processed = 0
-    submitted = 0
     _t0 = time.time()
 
-    def _handle_completed(msg, dryrun):
-        """Handle a completed decryption — do IMAP replace or report error.
-        Returns (success: bool, fatal_error: str|None)."""
-        nonlocal decrypted_count, failed_count, processed
+    def _handle_completed_future(msg):
+        """Handle a completed decryption future.
+        Returns (continue_ok, fatal_error)."""
+        ok, fatal = _handle_message_outcome(
+            msg, conn, folder_name, dryrun, ignore_failures,
+            move_failures, errors, dbg, quiet_progress,
+            on_message_decrypted, counters,
+        )
 
-        uid = msg["uid"]
-        msg_label = msg["_label"]
-
-        if msg.get("error"):
-            error_msg = (f"Decryption failed: {msg_label}: "
-                         f"{msg['error']}")
-            if ignore_failures or move_failures:
-                print(f"\n    ERROR: {error_msg}", file=sys.stderr)
-                errors.append(error_msg)
-                failed_count += 1
-
-                if move_failures and not dryrun:
-                    move_err = move_message_to_failed(
-                        conn, folder_name, uid, msg["raw_message"],
-                        msg["flags"], msg["internaldate"],
-                    )
-                    if move_err:
-                        print(f"    WARNING: {move_err}",
-                              file=sys.stderr)
-                        errors.append(move_err)
-                    else:
-                        print(f"    Moved to {folder_name}.failed")
-                    imap_helpers.select_folder(
-                        conn, folder_name, readonly=False
-                    )
-                elif move_failures and dryrun:
-                    print(f"    Would move to "
-                          f"{folder_name}.failed (dryrun)")
-                return True, None
-            return False, error_msg
-
-        decrypted_count += 1
-        _increment_global_decrypted()
-        if on_message_decrypted is not None:
-            on_message_decrypted()
-        processed += 1
-        elapsed = time.time() - _t0
-        rate = processed / elapsed if elapsed > 0 else 0
-
-        if dryrun:
-            if not quiet_progress:
-                print(f"\r    [{processed}/{total}] {rate:.1f} msg/s — "
-                      f"UID {uid}: decryption OK (dryrun)          ",
-                      flush=True)
-            return True, None
-
-        err = replace_message(conn, folder_name, msg, dbg)
-        if err:
-            error_msg = f"{err}: {msg_label}"
-            if ignore_failures:
-                print(f"\n    WARNING: {error_msg}", file=sys.stderr)
-                errors.append(error_msg)
-                failed_count += 1
-                return True, None
-            return False, error_msg
-
-        if not quiet_progress:
+        if ok and not quiet_progress and not msg.error and not dryrun:
+            elapsed = time.time() - _t0
+            processed = counters["processed"]
+            rate = processed / elapsed if elapsed > 0 else 0
             print(f"\r    [{processed}/{total}] {rate:.1f} msg/s — "
-                  f"UID {uid}: decrypted and replaced          ",
+                  f"UID {msg.uid}: decrypted and replaced          ",
                   end="", flush=True)
-        dbg(f"Done with UID {uid}")
 
-        # Free memory
-        msg.pop("raw_message", None)
-        msg.pop("final_message", None)
-        return True, None
+        return ok, fatal
 
-    def _drain_completed(futures_dict, pool, block=False):
+    def _drain_completed(futures_dict, block=False):
         """Collect and replace all completed futures.
         If block=True, wait for at least one to complete.
         Returns a fatal error string or None."""
@@ -695,10 +644,10 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
             try:
                 f.result()
             except Exception as exc:
-                msg["error"] = str(exc)
-                msg["final_message"] = None
+                msg.error = str(exc)
+                msg.final_message = None
 
-            ok, fatal = _handle_completed(msg, dryrun)
+            ok, fatal = _handle_completed_future(msg)
             if not ok:
                 # Cancel remaining futures
                 for remaining in futures_dict:
@@ -720,18 +669,18 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
                           file=sys.stderr)
                 break
 
-            uid = msg["uid"]
+            uid = msg.uid
 
             # Fetch full message (IMAP, main thread)
             try:
-                msg["raw_message"] = fetch_full_message(conn, uid, dbg)
+                msg.raw_message = fetch_full_message(conn, uid, dbg)
             except Exception as exc:
-                msg["raw_message"] = None
-                error_msg = f"Fetch failed: {msg['_label']}: {exc}"
+                msg.raw_message = None
+                error_msg = f"Fetch failed: {msg.label}: {exc}"
                 if ignore_failures:
                     print(f"\n    WARNING: {error_msg}", file=sys.stderr)
                     errors.append(error_msg)
-                    failed_count += 1
+                    counters["failed"] += 1
                     continue
                 else:
                     fatal_error = error_msg
@@ -740,18 +689,17 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
             # Submit for parallel decryption
             future = pool.submit(decrypt_message, msg, keys)
             futures[future] = msg
-            submitted += 1
 
             # If pool is saturated, drain at least one completed result
             # before fetching more (bounds memory to ~workers messages)
             if len(futures) >= workers:
-                fatal = _drain_completed(futures, pool, block=True)
+                fatal = _drain_completed(futures, block=True)
                 if fatal:
                     fatal_error = fatal
                     break
 
             # Also drain any that finished while we were fetching
-            fatal = _drain_completed(futures, pool, block=False)
+            fatal = _drain_completed(futures, block=False)
             if fatal:
                 fatal_error = fatal
                 break
@@ -764,7 +712,7 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
                         print("\n  Stopping early due to interrupt.",
                               file=sys.stderr)
                     break
-                fatal = _drain_completed(futures, pool, block=True)
+                fatal = _drain_completed(futures, block=True)
                 if fatal:
                     fatal_error = fatal
                     break
@@ -775,10 +723,10 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
             f.cancel()
         pool.shutdown(wait=False)
 
-    if processed > 0 and not quiet_progress:
+    if counters["processed"] > 0 and not quiet_progress:
         print(flush=True)  # newline after \r progress
 
     if fatal_error:
         errors.insert(0, fatal_error)
 
-    return decrypted_count, failed_count, errors
+    return counters["decrypted"], counters["failed"], errors

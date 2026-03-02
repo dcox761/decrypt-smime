@@ -413,3 +413,53 @@ Each active folder shows `decrypted/total` so you can see individual folder prog
 - `_remove_active_folder()` in the `finally` block removes the folder when done
 
 The ticker is started before the folder pool and stopped in a `finally` block via `_progress_stop` threading Event. It uses `_print_lock` for thread-safe output.
+
+## Planned Refactoring
+
+See [`plans/refactor-smime-plan.md`](plans/refactor-smime-plan.md) for the full phased implementation plan.
+
+### Motivation
+
+The codebase has grown to ~1800 lines across 5 files with significant duplication, manual IMAP response parsing, and ad-hoc data structures. Several patterns can be simplified using functional programming idioms, prebuilt libraries, and Python standard library features.
+
+### Summary of Changes
+
+#### Migrate from `imaplib` to `imapclient`
+
+The single biggest simplification. [`imapclient`](https://imapclient.readthedocs.io/) eliminates ~150 lines of manual IMAP response parsing:
+
+- [`parse_list_response()`](smime/imap.py:55) — replaced by `client.list_folders()`
+- [`decode_modified_utf7()`](smime/imap.py:74) — handled transparently by imapclient
+- [`extract_flags_from_fetch()`](smime/imap.py:158), [`extract_uid_from_fetch()`](smime/imap.py:175), [`extract_internaldate_from_fetch()`](smime/imap.py:189) — FETCH returns pre-parsed dicts with typed values
+- [`format_imap_flags()`](smime/imap.py:203) — `imapclient.append()` accepts flag lists natively
+- Folder quoting workarounds in [`replace_message()`](smime/processor.py:225) and [`move_message_to_failed()`](smime/processor.py:314) — imapclient quotes correctly
+
+The dovecot.conf workarounds for `mail_index_path`, `mail_control_path`, and `fts_autoindex = no` resolve the dotlock contention issues at the server level, making the imapclient migration safe.
+
+#### Introduce `MessageRecord` dataclass
+
+Replace the ad-hoc dict documented at [`processor.py:63-69`](smime/processor.py:63) with a typed `@dataclass`. Provides IDE autocompletion, eliminates dict-key typo risks, and formalises the `_label` field added in [`_process_parallel()`](smime/processor.py:564).
+
+#### Functional pattern refactors
+
+| Pattern | Location | Change |
+|---|---|---|
+| filter+map | [`scan_folder()`](smime/processor.py:121) parsing loop | Replace while-loop with `filter(None, map(parse_item, data))` |
+| List comprehensions | [`filter_encrypted()`](smime/processor.py:148) | Replace manual loop+counter with two comprehensions |
+| `itertools.chain` | [`reconstruct_message()`](smime/crypto.py:319) | Collapse three header assembly loops into one chain |
+| Precomputed `frozenset` | [`reconstruct_message()`](smime/crypto.py:334) | Replace O(n) `hdr.lower() in [h.lower() for h in ...]` with O(1) set lookup |
+| `TemporaryDirectory` | [`decrypt_smime_message()`](smime/crypto.py:148) | Replace manual temp file lifecycle with auto-cleaned temp dir |
+| Dict comprehension | [`reconstruct_message()`](smime/crypto.py:302) override_map | Replace loop with `{h.lower(): [...] for h in ... if ...}` using walrus |
+
+#### DRY refactors in orchestration
+
+| Pattern | Location | Change |
+|---|---|---|
+| Shared error handler | [`_process_sequential()`](smime/processor.py:467) and [`_handle_completed()`](smime/processor.py:603) | Extract `_handle_message_outcome()` — ~60 lines of shared decision tree |
+| Shared `clean_flags()` | [`replace_message()`](smime/processor.py:240), [`move_message_to_failed()`](smime/processor.py:326) | Extract to [`smime/imap.py`](smime/imap.py) utility |
+| `_submit_next()` helper | [`decrypt-smime.py`](decrypt-smime.py) lines 337-346, 351-360, 384-390 | Three identical copies → one function |
+| `_accumulate()` helper | [`decrypt-smime.py`](decrypt-smime.py) lines 363-369, 422-428 | Two identical result-accumulation blocks → one function |
+
+#### Modernise `email.policy`
+
+Switch from `email.policy.compat32` to `email.policy.default` in [`smime/crypto.py`](smime/crypto.py) for cleaner header access. Requires testing with non-ASCII subjects and multipart messages to verify RFC 2822 output compatibility.

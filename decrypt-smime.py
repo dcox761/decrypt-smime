@@ -10,7 +10,7 @@ flags and headers.
 This is the entry-point script.  All logic lives in the ``smime`` package:
 
   smime/cli.py        — CLI argument parsing
-  smime/imap.py       — IMAP connection helpers
+  smime/imap.py       — IMAP connection helpers (imapclient-based)
   smime/crypto.py     — key loading, S/MIME detection, decryption
   smime/processor.py  — folder/message processing & parallel orchestration
 """
@@ -25,9 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from smime.cli import parse_args
 from smime.crypto import load_key_chain
-from smime.imap import (
-    connect_to_server, login, get_all_folders, decode_modified_utf7,
-)
+from smime.imap import connect_to_server, login, get_all_folders
 from smime.processor import (
     process_folder, set_interrupted, is_interrupted,
     get_global_decrypted, reset_global_decrypted,
@@ -112,6 +110,46 @@ def _progress_ticker(wall_t0, interval=3.0):
 
 
 # ---------------------------------------------------------------------------
+# Result accumulation helper
+# ---------------------------------------------------------------------------
+
+def _accumulate(totals, result):
+    """Merge a single folder result into the running totals dict."""
+    totals["messages"] += result["total"]
+    totals["encrypted"] += result["encrypted"]
+    totals["decrypted"] += result["decrypted"]
+    totals["failed"] += result["failed"]
+    totals["elapsed"] += result["elapsed"]
+    totals["errors"].extend(result["errors"])
+    totals["summaries"].append(result)
+
+
+def _make_totals():
+    """Create a fresh totals accumulator."""
+    return {
+        "messages": 0, "encrypted": 0, "decrypted": 0,
+        "failed": 0, "elapsed": 0.0,
+        "errors": [], "summaries": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Folder submission helper (DRY — used 3× in parallel path)
+# ---------------------------------------------------------------------------
+
+def _submit_next(folder_iter, pool, futures, args, keys, password):
+    """Submit the next folder from *folder_iter* to *pool*, if available."""
+    if is_interrupted():
+        return
+    try:
+        fi = next(folder_iter)
+        f = pool.submit(_process_one_folder, fi, args, keys, password)
+        futures[f] = fi
+    except StopIteration:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Folder-level worker (one IMAP connection per thread)
 # ---------------------------------------------------------------------------
 
@@ -126,28 +164,28 @@ def _process_one_folder(folder_info, args, keys, password):
     if is_interrupted():
         return None
 
-    folder_flags_str, delimiter, folder_name = folder_info
-    display_name = decode_modified_utf7(folder_name)
+    folder_flags, delimiter, folder_name = folder_info
 
+    # imapclient returns flags as tuples of bytes
     # Skip non-selectable folders
-    if folder_flags_str and (
-        "\\Noselect" in folder_flags_str
-        or "\\NonExistent" in folder_flags_str
+    if folder_flags and (
+        b"\\Noselect" in folder_flags
+        or b"\\NonExistent" in folder_flags
     ):
         with _print_lock:
-            print(f"  Skipping non-selectable folder: {display_name}")
+            print(f"  Skipping non-selectable folder: {folder_name}")
         return None
 
     quiet = args.connections > 1
     mode_label = ("Counting" if args.count
                   else ("Dryrun" if args.dryrun else "Processing"))
     with _print_lock:
-        print(f"\n  {mode_label}: {display_name} ...", flush=True)
+        print(f"\n  {mode_label}: {folder_name} ...", flush=True)
 
     # Callback to print scan results immediately after scanning
     def _on_scan_complete(total, enc):
         with _print_lock:
-            print(f"  {display_name}: "
+            print(f"  {folder_name}: "
                   f"{total} messages, {enc} encrypted", flush=True)
 
     conn = None
@@ -158,25 +196,21 @@ def _process_one_folder(folder_info, args, keys, password):
 
         (msg_count, encrypted, decrypted, failed,
          errors, elapsed) = process_folder(
-            conn, folder_name, display_name,
+            conn, folder_name, folder_name,
             keys, args.count, args.dryrun,
             args.ignore_failures, args.move_failures,
             debug=args.debug,
             workers=args.workers,
             quiet_progress=quiet,
             on_decrypt_start=lambda enc: _add_active_folder(
-                display_name, enc),
+                folder_name, enc),
             on_message_decrypted=lambda: _update_active_folder(
-                display_name),
+                folder_name),
             on_scan_complete=_on_scan_complete,
         )
     finally:
-        _remove_active_folder(display_name)
+        _remove_active_folder(folder_name)
         if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
             try:
                 conn.logout()
             except Exception:
@@ -185,7 +219,7 @@ def _process_one_folder(folder_info, args, keys, password):
     rate = decrypted / elapsed if elapsed > 0 and decrypted > 0 else 0
 
     result = {
-        "name": display_name,
+        "name": folder_name,
         "total": msg_count,
         "encrypted": encrypted,
         "decrypted": decrypted,
@@ -203,7 +237,7 @@ def _process_one_folder(folder_info, args, keys, password):
                 parts.append(f"{failed} failed")
             if rate > 0:
                 parts.append(f"{rate:.1f} msg/s")
-            print(f"  {display_name}: {', '.join(parts)}")
+            print(f"  {folder_name}: {', '.join(parts)}")
 
     return result
 
@@ -261,13 +295,7 @@ def main():
     print_separator()
 
     # Process folders
-    total_messages_all = 0
-    total_encrypted_all = 0
-    total_decrypted_all = 0
-    total_failed_all = 0
-    total_elapsed_all = 0.0
-    all_errors = []
-    folder_summaries = []
+    totals = _make_totals()
     exit_code = 0
     wall_t0 = time.time()
 
@@ -289,14 +317,8 @@ def main():
                 for _ in range(min(num_connections, len(folders))):
                     if is_interrupted():
                         break
-                    try:
-                        fi = next(folder_iter)
-                    except StopIteration:
-                        break
-                    f = pool.submit(
-                        _process_one_folder, fi, args, keys, password
-                    )
-                    futures[f] = fi
+                    _submit_next(folder_iter, pool, futures, args,
+                                 keys, password)
 
                 # Process completed folders and submit new ones
                 stop = False
@@ -325,7 +347,7 @@ def main():
                             fname = folder_info[2]
                             print(f"\nERROR processing {fname}: {exc}",
                                   file=sys.stderr)
-                            all_errors.append(f"{fname}: {exc}")
+                            totals["errors"].append(f"{fname}: {exc}")
                             if not args.ignore_failures \
                                     and not args.move_failures:
                                 exit_code = 1
@@ -333,40 +355,17 @@ def main():
                                     f.cancel()
                                 stop = True
                                 break
-                            # Submit next folder to keep pool busy
-                            if not is_interrupted():
-                                try:
-                                    fi = next(folder_iter)
-                                    nf = pool.submit(
-                                        _process_one_folder, fi, args,
-                                        keys, password
-                                    )
-                                    futures[nf] = fi
-                                except StopIteration:
-                                    pass
+                            _submit_next(folder_iter, pool, futures,
+                                         args, keys, password)
                             continue
 
                         if result is None:
                             # Skipped folder — submit next
-                            if not is_interrupted():
-                                try:
-                                    fi = next(folder_iter)
-                                    nf = pool.submit(
-                                        _process_one_folder, fi, args,
-                                        keys, password
-                                    )
-                                    futures[nf] = fi
-                                except StopIteration:
-                                    pass
+                            _submit_next(folder_iter, pool, futures,
+                                         args, keys, password)
                             continue
 
-                        total_messages_all += result["total"]
-                        total_encrypted_all += result["encrypted"]
-                        total_decrypted_all += result["decrypted"]
-                        total_failed_all += result["failed"]
-                        total_elapsed_all += result["elapsed"]
-                        all_errors.extend(result["errors"])
-                        folder_summaries.append(result)
+                        _accumulate(totals, result)
 
                         if (result["errors"]
                                 and not args.ignore_failures
@@ -381,16 +380,8 @@ def main():
                             break
 
                         # Submit next folder to keep pool busy
-                        if not is_interrupted():
-                            try:
-                                fi = next(folder_iter)
-                                nf = pool.submit(
-                                    _process_one_folder, fi, args,
-                                    keys, password
-                                )
-                                futures[nf] = fi
-                            except StopIteration:
-                                pass
+                        _submit_next(folder_iter, pool, futures,
+                                     args, keys, password)
             finally:
                 _progress_stop.set()
                 ticker.join(timeout=1)
@@ -410,7 +401,7 @@ def main():
                     fname = folder_info[2]
                     print(f"\nERROR processing {fname}: {exc}",
                           file=sys.stderr)
-                    all_errors.append(f"{fname}: {exc}")
+                    totals["errors"].append(f"{fname}: {exc}")
                     if not args.ignore_failures and not args.move_failures:
                         exit_code = 1
                         break
@@ -419,13 +410,7 @@ def main():
                 if result is None:
                     continue
 
-                total_messages_all += result["total"]
-                total_encrypted_all += result["encrypted"]
-                total_decrypted_all += result["decrypted"]
-                total_failed_all += result["failed"]
-                total_elapsed_all += result["elapsed"]
-                all_errors.extend(result["errors"])
-                folder_summaries.append(result)
+                _accumulate(totals, result)
 
                 if (result["errors"]
                         and not args.ignore_failures
@@ -449,21 +434,24 @@ def main():
     print("SUMMARY")
     print_separator()
 
+    folder_summaries = totals["summaries"]
+    all_errors = totals["errors"]
+
     print(f"\nFolders processed:       {len(folder_summaries)}")
-    print(f"Total messages:          {total_messages_all}")
-    print(f"Encrypted messages:      {total_encrypted_all}")
+    print(f"Total messages:          {totals['messages']}")
+    print(f"Encrypted messages:      {totals['encrypted']}")
 
     if not args.count:
-        print(f"Decrypted messages:      {total_decrypted_all}")
-        if total_failed_all > 0:
-            print(f"Failed messages:         {total_failed_all}")
-        if wall_elapsed > 0 and total_decrypted_all > 0:
-            wall_rate = total_decrypted_all / wall_elapsed
+        print(f"Decrypted messages:      {totals['decrypted']}")
+        if totals["failed"] > 0:
+            print(f"Failed messages:         {totals['failed']}")
+        if wall_elapsed > 0 and totals["decrypted"] > 0:
+            wall_rate = totals["decrypted"] / wall_elapsed
             print(f"Wall-clock time:         {wall_elapsed:.1f}s")
             print(f"Overall rate:            {wall_rate:.1f} msg/s")
             if num_connections > 1:
-                cpu_rate = (total_decrypted_all / total_elapsed_all
-                            if total_elapsed_all > 0 else 0)
+                cpu_rate = (totals["decrypted"] / totals["elapsed"]
+                            if totals["elapsed"] > 0 else 0)
                 print(f"Per-connection rate:     {cpu_rate:.1f} msg/s")
         if args.dryrun:
             print("\n(dryrun mode — no messages were modified)")
@@ -489,12 +477,14 @@ def main():
     print()
     print_separator()
 
-    if total_failed_all > 0 and exit_code == 0:
+    if totals["failed"] > 0 and exit_code == 0:
         exit_code = 1
 
     # Use os._exit to bypass atexit handlers that would block on
     # ThreadPoolExecutor thread joins (both folder-level and inner
     # decrypt-worker pools may have lingering threads after errors).
+    sys.stdout.flush()
+    sys.stderr.flush()
     os._exit(exit_code)
 
 

@@ -7,4 +7,6 @@ the encrypted originals with decrypted versions while preserving all
 flags and headers.
 """
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
+
+from .processor import MessageRecord  # noqa: F401
