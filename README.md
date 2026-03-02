@@ -126,7 +126,11 @@ The tool is implemented as a thin entry point [`decrypt-smime.py`](decrypt-smime
 | [`smime/crypto.py`](smime/crypto.py) | S/MIME detection, key loading, openssl decryption, message reconstruction |
 | [`smime/processor.py`](smime/processor.py) | Folder scanning, sequential/parallel message processing, IMAP replace/move |
 
-See [`plans/decrypt-smime-plan.md`](plans/decrypt-smime-plan.md) for the full architecture and design.
+See the [`plans/`](plans/) directory for architecture and design documents:
+
+- [`decrypt-smime-plan.md`](plans/decrypt-smime-plan.md) — full architecture, CLI design, and implementation steps
+- [`parallel-pipeline-plan.md`](plans/parallel-pipeline-plan.md) — dual-connection parallel pipeline design
+- [`refactor-smime-plan.md`](plans/refactor-smime-plan.md) — modular package refactoring plan
 
 ## Security Notes
 
