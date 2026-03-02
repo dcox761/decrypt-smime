@@ -189,10 +189,18 @@ def _process_one_folder(folder_info, args, keys, password):
                   f"{total} messages, {enc} encrypted", flush=True)
 
     conn = None
+    write_conn = None
     try:
-        # Each folder gets its own connection (quiet to avoid noisy output)
+        # Each folder gets its own read connection
         conn = connect_to_server(args.host, args.port, quiet=True)
         login(conn, args.user, password, quiet=True)
+
+        # Open a second connection for writes when using pipeline mode
+        need_pipeline = (args.workers > 1 and not args.count
+                         and not args.dryrun)
+        if need_pipeline:
+            write_conn = connect_to_server(args.host, args.port, quiet=True)
+            login(write_conn, args.user, password, quiet=True)
 
         (msg_count, encrypted, decrypted, failed,
          errors, elapsed) = process_folder(
@@ -207,14 +215,16 @@ def _process_one_folder(folder_info, args, keys, password):
             on_message_decrypted=lambda: _update_active_folder(
                 folder_name),
             on_scan_complete=_on_scan_complete,
+            write_conn=write_conn,
         )
     finally:
         _remove_active_folder(folder_name)
-        if conn is not None:
-            try:
-                conn.logout()
-            except Exception:
-                pass
+        for c in (conn, write_conn):
+            if c is not None:
+                try:
+                    c.logout()
+                except Exception:
+                    pass
 
     rate = decrypted / elapsed if elapsed > 0 and decrypted > 0 else 0
 
@@ -288,9 +298,15 @@ def main():
         pass
 
     num_connections = args.connections
-    if num_connections > 1:
-        print(f"Using {num_connections} parallel connections, "
-              f"{args.workers} decrypt workers each.")
+    pipeline = args.workers > 1 and not args.count and not args.dryrun
+    if num_connections > 1 or pipeline:
+        parts = []
+        if num_connections > 1:
+            parts.append(f"{num_connections} parallel folder connections")
+        if pipeline:
+            parts.append(f"pipeline mode (2 IMAP connections per folder)")
+        parts.append(f"{args.workers} decrypt workers")
+        print(f"Using {', '.join(parts)}.")
 
     print_separator()
 

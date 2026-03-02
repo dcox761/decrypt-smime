@@ -7,6 +7,7 @@ Orchestrates scanning folders for encrypted messages, decrypting them
 
 from __future__ import annotations
 
+import queue as queue_mod
 import sys
 import threading
 import time
@@ -220,6 +221,32 @@ def decrypt_message(msg: MessageRecord, keys: list):
 # IMAP replace — APPEND decrypted + STORE \Deleted on original
 # ---------------------------------------------------------------------------
 
+def append_decrypted(conn: IMAPClient, folder_name: str, msg: MessageRecord,
+                     debug_fn=None):
+    """
+    APPEND the decrypted version of a message to *folder_name* on *conn*.
+
+    Does **not** SELECT or STORE — the caller is responsible for batching
+    ``\\Deleted`` flags separately via :func:`imap_helpers.batch_store_deleted`.
+
+    Returns None on success or an error string.
+    """
+    append_flags = imap_helpers.clean_flags(msg.flags)
+    if debug_fn:
+        debug_fn(f"APPEND flags={append_flags} date={msg.internaldate} "
+                 f"size={len(msg.final_message)}")
+    try:
+        conn.append(folder_name, msg.final_message,
+                    flags=append_flags, msg_time=msg.internaldate)
+        if debug_fn:
+            debug_fn("APPEND OK")
+        return None
+    except Exception as exc:
+        if debug_fn:
+            debug_fn(f"APPEND exception: {exc}")
+        return f"APPEND failed for UID {msg.uid}: {exc}"
+
+
 def replace_message(conn: IMAPClient, folder_name: str, msg: MessageRecord,
                     debug_fn=None):
     """
@@ -430,7 +457,8 @@ def process_folder(conn: IMAPClient, folder_name: str, display_name: str,
                    debug: bool = False, workers: int = 1,
                    quiet_progress: bool = False,
                    on_decrypt_start=None, on_scan_complete=None,
-                   on_message_decrypted=None):
+                   on_message_decrypted=None,
+                   write_conn: IMAPClient | None = None):
     """
     Process a single folder: detect and optionally decrypt S/MIME messages.
 
@@ -446,6 +474,11 @@ def process_folder(conn: IMAPClient, folder_name: str, display_name: str,
     report scan results immediately.
     *on_message_decrypted* is an optional callback invoked after each
     successful message decryption (for live progress tracking).
+    *write_conn* is an optional second IMAP connection used for APPEND
+    and STORE operations in the pipeline path (``workers > 1``).
+    When provided, the reader (FETCH on *conn*) and writer (APPEND/STORE
+    on *write_conn*) run concurrently, eliminating the bottleneck where
+    REPLACE blocks FETCH.
 
     Returns ``(total_messages, encrypted_count, decrypted_count,
     failed_count, error_list, elapsed_secs)``.
@@ -486,8 +519,16 @@ def process_folder(conn: IMAPClient, folder_name: str, display_name: str,
     failed_count = 0
     errors = []
 
-    if workers > 1:
-        # Parallel path: pipeline decrypt, sequential replace
+    if workers > 1 and write_conn is not None and not dryrun:
+        # Pipeline path: reader on conn, writer on write_conn
+        decrypted_count, failed_count, errors = _process_pipeline(
+            conn, write_conn, folder_name, encrypted_msgs, keys,
+            dryrun, ignore_failures, move_failures,
+            workers, dbg, quiet_progress,
+            on_message_decrypted=on_message_decrypted,
+        )
+    elif workers > 1:
+        # Parallel path: pipeline decrypt, sequential replace (single conn)
         decrypted_count, failed_count, errors = _process_parallel(
             conn, folder_name, encrypted_msgs, keys,
             dryrun, ignore_failures, move_failures,
@@ -503,11 +544,15 @@ def process_folder(conn: IMAPClient, folder_name: str, display_name: str,
             on_message_decrypted=on_message_decrypted,
         )
 
-    # Expunge \\Deleted messages at end of folder
+    # Expunge \\Deleted messages at end of folder.
+    # In pipeline mode, write_conn did the STORE \Deleted so it must
+    # do the CLOSE/expunge.  In other modes, conn does it.
+    expunge_conn = write_conn if (write_conn and not dryrun and workers > 1) else conn
     if decrypted_count > 0 and not dryrun and not count_only:
         dbg("CLOSE (expunge all \\Deleted messages)")
         try:
-            conn.close_folder()
+            imap_helpers.select_folder(expunge_conn, folder_name, readonly=False)
+            expunge_conn.close_folder()
         except Exception:
             pass
 
@@ -728,5 +773,317 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
 
     if fatal_error:
         errors.insert(0, fatal_error)
+
+    return counters["decrypted"], counters["failed"], errors
+
+
+# ---------------------------------------------------------------------------
+# Pipeline processing (workers>1 + write_conn) — dual-connection
+# ---------------------------------------------------------------------------
+
+_SENTINEL = None  # signals the writer thread to stop
+
+
+def _process_pipeline(read_conn, write_conn, folder_name, encrypted_msgs,
+                      keys, dryrun, ignore_failures, move_failures,
+                      workers, dbg, quiet_progress=False,
+                      on_message_decrypted=None, batch_size=10):
+    """
+    Dual-connection pipeline: FETCH on *read_conn*, APPEND+STORE on
+    *write_conn*, with a thread pool for decryption in between.
+
+    Three concurrent stages:
+      1. **Reader** (main thread): FETCHes raw messages → submits to pool
+      2. **Workers** (thread pool): decrypt via openssl subprocesses
+      3. **Writer** (dedicated thread): APPENDs decrypted messages on
+         *write_conn*, batch-STOREs ``\\Deleted`` every *batch_size* msgs
+
+    The reader never blocks on IMAP writes, keeping the worker pool
+    saturated.  Memory is bounded to ~``workers + batch_size`` messages.
+
+    Returns ``(decrypted, failed, errors)``.
+    """
+    counters = {"decrypted": 0, "failed": 0, "processed": 0}
+    errors = []
+    total = len(encrypted_msgs)
+
+    # Thread-safe shared state
+    _counters_lock = threading.Lock()
+    writer_fatal = [None]  # mutable slot for writer-thread fatal error
+    writer_done = threading.Event()
+
+    if not quiet_progress:
+        print(f"    Processing {total} encrypted messages "
+              f"with {workers} workers (pipeline mode) ...", flush=True)
+
+    # Pre-compute labels
+    for msg in encrypted_msgs:
+        msg_id_info = crypto.extract_message_info(msg.header)
+        msg.label = crypto.format_message_id(str(msg.uid), msg_id_info)
+
+    _t0 = time.time()
+
+    # Queue between decrypt pool output and writer thread
+    # Bounded to prevent unbounded memory growth
+    write_queue = queue_mod.Queue(maxsize=batch_size * 2)
+
+    # ------------------------------------------------------------------
+    # Writer thread
+    # ------------------------------------------------------------------
+    def _writer():
+        """
+        Consume decrypted messages from the queue, APPEND them via
+        *write_conn*, and batch-STORE ``\\Deleted`` on originals.
+        """
+        pending_uids = []  # UIDs that have been APPENDed but not yet STORE'd
+
+        def _flush_deletes():
+            """Batch STORE \\Deleted on accumulated UIDs."""
+            if not pending_uids:
+                return
+            try:
+                imap_helpers.batch_store_deleted(
+                    write_conn, folder_name, list(pending_uids), dbg
+                )
+            except Exception as exc:
+                err = f"batch STORE \\Deleted failed: {exc}"
+                if not ignore_failures:
+                    writer_fatal[0] = err
+                else:
+                    print(f"\n    WARNING: {err}", file=sys.stderr)
+                    errors.append(err)
+            pending_uids.clear()
+
+        try:
+            while True:
+                if _interrupted:
+                    break
+
+                # Check if reader flagged a fatal error
+                if writer_fatal[0] is not None:
+                    break
+
+                try:
+                    msg = write_queue.get(timeout=0.5)
+                except queue_mod.Empty:
+                    continue
+
+                if msg is _SENTINEL:
+                    break
+
+                uid = msg.uid
+
+                # --- Handle decryption failure ---
+                if msg.error:
+                    error_msg = f"Decryption failed: {msg.label}: {msg.error}"
+                    if ignore_failures or move_failures:
+                        print(f"    ERROR: {error_msg}", file=sys.stderr)
+                        errors.append(error_msg)
+                        with _counters_lock:
+                            counters["failed"] += 1
+
+                        if move_failures:
+                            move_err = move_message_to_failed(
+                                write_conn, folder_name, uid,
+                                msg.raw_message, msg.flags, msg.internaldate,
+                            )
+                            if move_err:
+                                print(f"    WARNING: {move_err}",
+                                      file=sys.stderr)
+                                errors.append(move_err)
+                            else:
+                                print(f"    Moved to {folder_name}.failed")
+                    else:
+                        writer_fatal[0] = error_msg
+                        break
+
+                    msg.raw_message = None
+                    msg.final_message = None
+                    continue
+
+                # --- APPEND decrypted message ---
+                err = append_decrypted(write_conn, folder_name, msg, dbg)
+                if err:
+                    error_msg = f"{err}: {msg.label}"
+                    if ignore_failures:
+                        print(f"    WARNING: {error_msg}", file=sys.stderr)
+                        errors.append(error_msg)
+                        with _counters_lock:
+                            counters["failed"] += 1
+                    else:
+                        writer_fatal[0] = error_msg
+                        break
+
+                    msg.raw_message = None
+                    msg.final_message = None
+                    continue
+
+                # Track successful APPEND
+                pending_uids.append(uid)
+                with _counters_lock:
+                    counters["decrypted"] += 1
+                    counters["processed"] += 1
+                _increment_global_decrypted()
+                if on_message_decrypted is not None:
+                    on_message_decrypted()
+
+                if not quiet_progress:
+                    with _counters_lock:
+                        processed = counters["processed"]
+                    elapsed = time.time() - _t0
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    print(f"\r    [{processed}/{total}] {rate:.1f} msg/s — "
+                          f"UID {uid}: decrypted and replaced          ",
+                          end="", flush=True)
+
+                # Free memory
+                msg.raw_message = None
+                msg.final_message = None
+
+                # Flush batch when full
+                if len(pending_uids) >= batch_size:
+                    _flush_deletes()
+                    if writer_fatal[0] is not None:
+                        break
+
+        finally:
+            # Flush any remaining pending deletes
+            _flush_deletes()
+            writer_done.set()
+
+    # ------------------------------------------------------------------
+    # Start writer thread
+    # ------------------------------------------------------------------
+    writer_thread = threading.Thread(target=_writer, daemon=True,
+                                     name="pipeline-writer")
+    writer_thread.start()
+
+    # ------------------------------------------------------------------
+    # Reader + decrypt pool (main thread)
+    # ------------------------------------------------------------------
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = {}  # future → msg
+    reader_fatal = None
+
+    def _drain_to_queue(block=False):
+        """Move completed decryptions from futures → write_queue.
+        Returns a fatal error string or None."""
+        if not futures:
+            return None
+
+        done_set = set()
+        if block:
+            for f in as_completed(futures):
+                done_set.add(f)
+                break
+        for f in list(futures):
+            if f.done():
+                done_set.add(f)
+
+        for f in done_set:
+            msg = futures.pop(f)
+            try:
+                f.result()
+            except Exception as exc:
+                msg.error = str(exc)
+                msg.final_message = None
+
+            # Put on write queue (blocks if queue is full — backpressure)
+            while not _interrupted and writer_fatal[0] is None:
+                try:
+                    write_queue.put(msg, timeout=0.5)
+                    break
+                except queue_mod.Full:
+                    continue
+            else:
+                if writer_fatal[0] is not None:
+                    return writer_fatal[0]
+
+        return writer_fatal[0]  # may have been set concurrently
+
+    try:
+        for msg in encrypted_msgs:
+            if _interrupted:
+                if not quiet_progress:
+                    print("\n  Stopping early due to interrupt.",
+                          file=sys.stderr)
+                break
+
+            # Check for writer errors
+            if writer_fatal[0] is not None:
+                reader_fatal = writer_fatal[0]
+                break
+
+            uid = msg.uid
+
+            # FETCH full message (IMAP, reader thread/conn)
+            try:
+                msg.raw_message = fetch_full_message(read_conn, uid, dbg)
+            except Exception as exc:
+                msg.raw_message = None
+                error_msg = f"Fetch failed: {msg.label}: {exc}"
+                if ignore_failures:
+                    print(f"\n    WARNING: {error_msg}", file=sys.stderr)
+                    errors.append(error_msg)
+                    with _counters_lock:
+                        counters["failed"] += 1
+                    continue
+                else:
+                    reader_fatal = error_msg
+                    break
+
+            # Submit for parallel decryption
+            future = pool.submit(decrypt_message, msg, keys)
+            futures[future] = msg
+
+            # Backpressure: drain when pool saturated
+            if len(futures) >= workers:
+                fatal = _drain_to_queue(block=True)
+                if fatal:
+                    reader_fatal = fatal
+                    break
+
+            # Also drain any that finished during FETCH
+            fatal = _drain_to_queue(block=False)
+            if fatal:
+                reader_fatal = fatal
+                break
+
+        # Drain all remaining futures
+        if not reader_fatal:
+            while futures:
+                if _interrupted:
+                    if not quiet_progress:
+                        print("\n  Stopping early due to interrupt.",
+                              file=sys.stderr)
+                    break
+                if writer_fatal[0] is not None:
+                    reader_fatal = writer_fatal[0]
+                    break
+                fatal = _drain_to_queue(block=True)
+                if fatal:
+                    reader_fatal = fatal
+                    break
+
+    finally:
+        # Cancel remaining decrypt futures
+        for f in futures:
+            f.cancel()
+        pool.shutdown(wait=False)
+
+        # Signal writer to stop and wait for it
+        try:
+            write_queue.put(_SENTINEL, timeout=5)
+        except queue_mod.Full:
+            pass
+        writer_thread.join(timeout=10)
+
+    if counters["processed"] > 0 and not quiet_progress:
+        print(flush=True)  # newline after \r progress
+
+    # Collect errors
+    fatal = reader_fatal or writer_fatal[0]
+    if fatal:
+        errors.insert(0, fatal)
 
     return counters["decrypted"], counters["failed"], errors

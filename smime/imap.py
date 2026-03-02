@@ -94,6 +94,43 @@ def ensure_folder_exists(conn: IMAPClient, folder_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Batch operations
+# ---------------------------------------------------------------------------
+
+def batch_store_deleted(conn: IMAPClient, folder_name: str, uids: list[int],
+                        dbg=None):
+    """
+    SELECT *folder_name*, STORE ``\\Deleted`` on all *uids* in a single
+    command, then UNSELECT to release dotlocks.
+
+    This amortises the SELECT/UNSELECT cost across an entire batch
+    instead of paying it per-message.
+    """
+    if not uids:
+        return
+    if dbg:
+        dbg(f"SELECT {folder_name} for batch STORE ({len(uids)} UIDs)")
+    select_folder(conn, folder_name, readonly=False)
+    if dbg:
+        dbg(f"STORE \\Deleted on UIDs: {uids[:5]}{'...' if len(uids) > 5 else ''}")
+    try:
+        conn.add_flags(uids, [b"\\Deleted"])
+    except Exception as exc:
+        if dbg:
+            dbg(f"batch STORE error: {exc}")
+        raise
+    if dbg:
+        dbg("UNSELECT after batch STORE")
+    try:
+        conn.unselect_folder()
+    except Exception:
+        try:
+            conn.close_folder()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Flag utilities
 # ---------------------------------------------------------------------------
 

@@ -25,7 +25,7 @@ I have used offlineimap to sync my Stalwart account to a local Maildir and setup
 - Moves failed messages to `.failed` sibling folders with `--move-failures`
 - Continues on errors with `--ignore-failures`, reporting all problems in the summary
 - Graceful Ctrl-C handling: first signal finishes current message, second force-exits
-- Parallel decryption within folders via `--workers` (pipeline: IMAP fetch → thread pool decrypt → IMAP replace)
+- Parallel decryption within folders via `--workers` (dual-connection pipeline: reader FETCH → thread pool decrypt → writer APPEND + batch STORE)
 - Parallel folder processing via `--connections` (independent IMAP connections per folder)
 - Live background progress ticker with per-folder and aggregate throughput metrics
 - Debug tracing for every IMAP operation via `--debug`
@@ -169,10 +169,11 @@ python decrypt-smime.py --privatekey key.pem --connections 5 --workers 32
 7. **Dryrun safety** — dryrun mode makes no mailbox modifications at all: no APPEND, no STORE, no folder creation, no moves
 8. **Skip `\Deleted` messages** — messages already marked `\Deleted` (e.g. from a previous interrupted run) are skipped to allow safe re-runs
 9. **`--debug` flag** — prints timestamped trace output for every IMAP operation to diagnose performance issues
-10. **`--workers N`** — parallel decryption within each folder via pipeline architecture (see [Parallelism Architecture](#parallelism-architecture))
+10. **`--workers N`** — parallel decryption within each folder via dual-connection pipeline architecture (see [Parallelism Architecture](#parallelism-architecture))
 11. **`--connections N`** — folder-level parallelism with independent IMAP connections (see [Parallelism Architecture](#parallelism-architecture))
 12. **Background progress ticker** — live throughput display every 3 seconds with active folder list when `--connections > 1`
 13. **Per-folder and overall throughput metrics** — msg/s rate in progress output, per-folder breakdown, and wall-clock rate in summary
+14. **Dual-connection pipeline** — when `--workers > 1`, each folder uses two IMAP connections: a reader (FETCH on readonly SELECT) and a writer (APPEND + batch STORE `\Deleted`). The reader never blocks on write operations, keeping the decrypt worker pool saturated. The writer batches `\Deleted` flags across 10 messages, reducing SELECT/UNSELECT cycles by 10×. Increases throughput from ~32 msg/s to ~67 msg/s with `--workers 32`.
 
 ### Known Issues and Workarounds
 
@@ -358,23 +359,24 @@ After making these changes, restart Dovecot: `docker compose restart dovecot`
 
 **Thread safety design**:
 - [`smime/crypto.py`](smime/crypto.py) functions are **thread-safe** (no IMAP I/O, only `openssl` subprocesses and in-memory operations)
-- [`smime/imap.py`](smime/imap.py) functions are **NOT thread-safe** (all use single `imaplib` connection)
-- Each parallel folder connection gets its own `imaplib.IMAP4` instance
+- [`smime/imap.py`](smime/imap.py) functions are **NOT thread-safe** (all use single `imapclient` connection)
+- Each parallel folder gets its own pair of `IMAPClient` instances (reader + writer)
 
 **Two-level parallelism**:
 
-1. **`--connections N`** — folder-level parallelism: N folders processed simultaneously, each on its own IMAP connection. Safe because Dovecot dotlocks are per-folder, so different folders have independent locks.
+1. **`--connections N`** — folder-level parallelism: N folders processed simultaneously, each on its own pair of IMAP connections. Safe because Dovecot dotlocks are per-folder, so different folders have independent locks.
    - Folders submitted incrementally (not all at once) so Ctrl-C stops new submissions immediately
    - Completed futures batch-drained to keep pool saturated and active-folder list accurate
    - Background ticker thread prints aggregate throughput every 3 seconds
 
-2. **`--workers N`** — within each folder, a pipeline overlaps IMAP I/O with parallel decryption:
-   - Main thread fetches message from IMAP → submits to `ThreadPoolExecutor` for decryption
-   - When pool reaches `workers` in-flight futures, drains completed results → does IMAP replace
-   - Net effect: up to `workers` openssl subprocesses run concurrently while main thread does IMAP I/O
-   - Memory bounded to ~`workers` full messages per folder connection
+2. **`--workers N`** — within each folder, a **dual-connection pipeline** separates read and write I/O:
+   - **Reader** (connection 1, readonly SELECT): continuously FETCHes messages → submits to `ThreadPoolExecutor` for decryption. Never blocks on write operations.
+   - **Workers** (thread pool): up to N `openssl cms -decrypt` subprocesses run concurrently.
+   - **Writer** (connection 2, dedicated thread): consumes completed decryptions from a queue → APPENDs each decrypted message → batch-STOREs `\Deleted` on original UIDs every 10 messages to amortise SELECT/UNSELECT overhead.
+   - Memory bounded to ~`workers + batch_size` full messages per folder.
+   - In `--dryrun` mode, no writer connection is opened — falls back to single-connection parallel path.
 
-Both levels can be combined: `--connections 5 --workers 32` runs 5 folders in parallel, each with 32 decrypt workers (160 openssl subprocesses peak).
+Both levels can be combined: `--connections 5 --workers 32` runs 5 folders in parallel, each with 2 IMAP connections and 32 decrypt workers.
 
 **Throughput metrics**:
 - Background ticker every 3s with per-folder progress: `⏱ 253 decrypted, 9s elapsed, 28.1 msg/s  [Archives/2012 50/126, Sent 200/10721]`
@@ -387,11 +389,12 @@ Both levels can be combined: `--connections 5 --workers 32` runs 5 folders in pa
 | Configuration | Rate | Notes |
 |---|---|---|
 | `--workers 1` (sequential) | ~4.3 msg/s | Baseline, single connection |
-| `--workers 10` | ~10 msg/s | 2.3× speedup |
-| `--workers 32` | ~32 msg/s | 7.4× speedup |
-| `--connections 5 --workers 32` | ~47 msg/s | Folder-level parallelism |
+| `--workers 10` | ~10 msg/s | 2.3× speedup (single-connection pipeline) |
+| `--workers 32` | ~32 msg/s | 7.4× speedup (single-connection pipeline) |
+| `--workers 32` (dual-conn pipeline) | ~67 msg/s | 15.6× speedup, reader never blocked |
+| `--connections 5 --workers 32` | ~47 msg/s | Folder-level parallelism (pre-pipeline) |
 
-The bottleneck at higher worker counts is the sequential IMAP replace phase (UNSELECT → APPEND → SELECT → STORE per message, ~30-230ms each depending on VirtioFS latency). Workers help by overlapping openssl subprocess time with IMAP I/O. Multiple connections help when there are many folders to process, reducing total wall-clock time.
+The previous bottleneck at higher worker counts was the sequential IMAP replace phase on the same connection (UNSELECT → APPEND → SELECT → STORE per message, ~30-230ms each). The dual-connection pipeline eliminates this by running FETCH on a readonly reader connection while a dedicated writer thread handles APPEND + batch STORE on a separate connection. The writer batches `\Deleted` flags across 10 messages, reducing SELECT/UNSELECT cycles by 10×.
 
 ### Global Decrypted Counter
 
