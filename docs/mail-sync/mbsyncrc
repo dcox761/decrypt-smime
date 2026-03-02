@@ -1,0 +1,27 @@
+# /mnt/config/mbsyncrc (abandoned — see mail-sync.md)
+
+IMAPAccount myaccount
+Host mail.example.com
+User mailuser
+PassCmd "cat /mnt/secret/password.conf"
+SSLType IMAPS
+CertificateFile /etc/ssl/certs/ca-certificates.crt
+
+IMAPStore myaccount-remote
+Account myaccount
+
+MaildirStore myaccount-local
+Inbox /mnt/mail/account
+SubFolders Maildir++
+# Maildir++ uses dot-prefix: .Sent .Drafts .Trash etc
+
+Channel myaccount
+Far :myaccount-remote:
+Near :myaccount-local:
+Patterns *
+Create Near
+Remove None
+Expunge None
+SyncState /mnt/mail/metadata/myaccount/
+Sync Pull
+# Pull = readonly equivalent (never pushes changes to remote)

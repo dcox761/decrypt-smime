@@ -6,6 +6,8 @@ Reference documentation for the Dovecot 2.4.2 Docker container used as a local I
 
 Dovecot is built from source (both core and Pigeonhole/Sieve) inside a multi-stage Docker image based on `debian:13-slim`. The final image runs as the unprivileged `vmail` user with rootless port bindings (31xxx range). A custom `dovecot.conf` is bind-mounted at runtime to override several defaults for compatibility with the offlineimap Maildir layout and the S/MIME decryption workflow.
 
+The Dovecot Docker repository was cloned from [github.com/dovecot/docker](https://github.com/dovecot/docker). The `2.4.2/` subdirectory was used to build a tagged image with the customisations documented here.
+
 ## Architecture
 
 ```
@@ -23,17 +25,26 @@ Dovecot is built from source (both core and Pigeonhole/Sieve) inside a multi-sta
                                               └───────────────────┘
 ```
 
+## Reference Files
+
+Sanitised copies of the configuration files are in the [`dovecot/`](dovecot/) subdirectory:
+
+| File | Purpose |
+|---|---|
+| [`docker-compose.yaml`](dovecot/docker-compose.yaml) | Service definition with port and volume mapping |
+| [`dovecot.conf`](dovecot/dovecot.conf) | Custom runtime configuration (bind-mounted over the image default) |
+
+The Dockerfile and built-in config files (auth, SSL, FTS, metrics, rootless ports, etc.) are part of the upstream [dovecot/docker](https://github.com/dovecot/docker) repository at `2.4.2/` and are not reproduced here.
+
 ## Building the Image
 
-The Dockerfile at `docker/2.4.2/Dockerfile` defines four build stages:
+The Dockerfile at `docker/2.4.2/Dockerfile` defines a multi-stage build:
 
-| Stage | Target | Description |
-|---|---|---|
-| `production-build` | Compile | Clones Dovecot core and Pigeonhole from GitHub, configures with full plugin support, builds and installs to `/dovecot` |
-| `production-base` | Runtime base | Copies compiled binaries, installs runtime libraries, creates `vmail` user, sets up directory structure and config files |
-| `production-root` | Root mode | Adds `dovecot`/`dovenull` system users, generates self-signed SSL cert, exposes standard ports (143, 993, etc.) |
-| `production-dev` | Rootless mode | Sets permissions for `vmail` user, applies `CAP_SYS_CHROOT` capabilities, exposes rootless ports (31143, 31993, etc.), includes `rootless.conf` |
-| `production` | Minimal | Strips packages (bash, coreutils, etc.) for minimal attack surface |
+1. **`production-build`** — Clones Dovecot core and Pigeonhole from GitHub, compiles with full plugin support (Flatcurve FTS, LDAP, Lua, PostgreSQL, MySQL, SQLite, Kerberos, ICU, LZ4, Zstd, experimental UTF-8 mail), installs to `/dovecot`
+2. **`production-base`** — Copies compiled binaries, installs runtime libraries, creates `vmail` user, copies config files into the image
+3. **`production-root`** — Adds system users, generates self-signed SSL cert, exposes standard ports
+4. **`production-dev`** — Rootless mode: `vmail` user with `CAP_SYS_CHROOT` capabilities, rootless ports (31xxx), includes `rootless.conf`
+5. **`production`** — Minimal: strips bash, coreutils, etc. for reduced attack surface
 
 Build with:
 
@@ -42,60 +53,19 @@ cd docker/2.4.2
 docker build --target production-dev -t dovecot:242 .
 ```
 
-The `production-dev` target is recommended for local use — it runs as the `vmail` user without requiring root, while retaining shell access for debugging. The `production` target strips nearly all userspace tools.
-
-### Build Features
-
-The Dovecot core is compiled with:
-
-- **Storage**: Maildir, mbox, dbox, sdbox, mdbox
-- **Search**: Flatcurve (Xapian-based full-text search), Solr
-- **Compression**: LZ4, Zstd, BZip2
-- **Auth**: LDAP, Kerberos/GSSAPI, PAM, SASL
-- **Database**: PostgreSQL, MySQL, SQLite
-- **Scripting**: Lua 5.3
-- **Text**: ICU normalisation, Snowball stemmer, libexttextcat language detection
-- **Security**: libcap, libsodium
-- **Experimental**: `--enable-experimental-mail-utf8`
-
-Pigeonhole (Sieve) is compiled with LDAP support and unfinished features enabled.
+The `production-dev` target is recommended for local use — it runs as the `vmail` user without requiring root, while retaining shell access for debugging.
 
 ## Docker Compose
 
-```yaml
-services:
-  dovecot:
-    image: dovecot:242
-    environment:
-      - USER_PASSWORD=password
-    ports:
-      - "8143:31143"
-    volumes:
-      - ./dovecot.conf:/etc/dovecot/dovecot.conf
-      - ../mail-sync/data/<account>:/srv/vmail/<user>/mail
-    restart: unless-stopped
-```
+See [`docker-compose.yaml`](dovecot/docker-compose.yaml) for the full service definition.
 
 ### Port Mapping
-
-The container listens on rootless ports internally. Docker maps them to host ports:
 
 | Host Port | Container Port | Protocol |
 |---|---|---|
 | `8143` | `31143` | IMAP (STARTTLS) |
 
-Additional rootless ports available in the image:
-
-| Container Port | Protocol |
-|---|---|
-| `31993` | IMAPS |
-| `31110` | POP3 |
-| `31995` | POP3S |
-| `31587` | Submission |
-| `31024` | LMTP |
-| `34190` | ManageSieve |
-| `8080` | Doveadm HTTP |
-| `9090` | Stats/Metrics HTTP |
+Additional rootless ports available: 31993 (IMAPS), 31110 (POP3), 31587 (Submission), 31024 (LMTP), 34190 (ManageSieve), 8080 (Doveadm), 9090 (Stats).
 
 ### Volume Mounts
 
@@ -106,172 +76,42 @@ Additional rootless ports available in the image:
 
 The Maildir is mounted at `/srv/vmail/<user>/mail` because `dovecot.conf` sets `mail_home = /srv/vmail/%{user | lower}` and `mail_path = ~/mail`.
 
-## Configuration
+## Custom Configuration: dovecot.conf
 
-### Main Configuration: `dovecot.conf`
+See [`dovecot.conf`](dovecot/dovecot.conf) for the full file. The key differences from the default image configuration are:
 
-This file is bind-mounted to replace the built-in config. Key differences from the default image config are noted below.
+### 1. Disabled `mailbox_list_layout = index`
+
+The default image config enables index-based mailbox listing with UTF-8 names (`mailbox_list_layout = index`, `mailbox_list_utf8 = yes`). This was disabled because the offlineimap Maildir uses traditional filesystem-based folder names with Maildir++ dot-prefix convention. Index layout requires Dovecot to build its own folder index, which may not match the physical directory structure created by offlineimap.
+
+### 2. Index and Control Paths on Container-Native Filesystem
 
 ```ini
-dovecot_config_version = 2.4.2
-dovecot_storage_version = 2.4.2
-
-base_dir = /run/dovecot
-state_dir = /run/dovecot
-
-protocols = imap submission lmtp sieve
-
-import_environment {
-  DOVEADM_PASSWORD = %{env:DOVEADM_PASSWORD | default('supersecret')}
-  USER_PASSWORD = %{env:USER_PASSWORD | default('supersecret')}
-}
-
-mail_driver = maildir
-mail_path = ~/mail
-mail_home = /srv/vmail/%{user | lower}
-
-# Performance: move index/control files off VirtioFS bind-mount
 mail_index_path = /tmp/dovecot-index/%{user | lower}
 mail_control_path = /tmp/dovecot-control/%{user | lower}
+```
 
+**Problem**: The Maildir lives on a macOS host volume bind-mounted via Docker's VirtioFS layer. Dovecot's dotlock operations (create → link → unlink) traverse `Container → Linux VM → VirtioFS → macOS → external volume`, making metadata operations very slow. This causes `dovecot-uidlist.lock` contention with "dotlock was overridden" warnings and ~3-second stalls.
+
+**Solution**: Move index and control files (which contain dotlock files) to the container's native filesystem. The actual mail stays on the bind-mounted volume. Index files are lost on container restart and must be rebuilt, which is acceptable for a local migration server.
+
+### 3. FTS Auto-Indexing Disabled
+
+```ini
+fts_autoindex = no
+```
+
+**Problem**: The built-in FTS config sets `fts_autoindex = yes`, triggering `indexer-worker` after every IMAP APPEND. During bulk operations (like `decrypt-smime.py` replacing thousands of messages), the indexer-worker and IMAP process race on `dovecot-uidlist.lock`.
+
+**Solution**: Disable FTS auto-indexing. This directive must appear **after** the `!include_try` lines to override the vendor default. Indexing can be triggered manually after migration: `doveadm index -u <user> '*'`.
+
+### 4. Raised Connection Limit
+
+```ini
 mail_max_userip_connections = 32
-mail_utf8_extensions = yes
-
-mail_uid = vmail
-mail_gid = vmail
-
-mail_attribute {
-  dict file {
-    path = %{home}/dovecot-attributes
-  }
-}
-
-log_path = /dev/stdout
-
-# ... services, protocols, plugins (see full file)
-
-!include_try vendor.d/*.conf
-!include_try conf.d/*.conf
-
-# Must be AFTER !include_try to override vendor defaults
-fts_autoindex = no
 ```
 
-### Changes from Default Image Config
-
-#### 1. Disabled `mailbox_list_layout = index` and `mailbox_list_utf8 = yes`
-
-The default image config enables index-based mailbox listing with UTF-8 names. This was disabled (commented out) because the offlineimap Maildir uses traditional filesystem-based folder names with Maildir++ dot-prefix convention. Index layout requires Dovecot to build its own folder index, which may not match the physical directory structure created by offlineimap.
-
-#### 2. Added `mail_index_path` and `mail_control_path`
-
-```ini
-mail_index_path = /tmp/dovecot-index/%{user | lower}
-mail_control_path = /tmp/dovecot-control/%{user | lower}
-```
-
-**Problem**: The Maildir lives on a macOS host volume bind-mounted via Docker's VirtioFS layer. Dovecot's dotlock operations (create → link → unlink) traverse `Container → Linux VM → VirtioFS → macOS → external volume`, making metadata operations very slow. This causes `dovecot-uidlist.lock` contention with "dotlock was overridden" warnings and ~3-second stalls per lock.
-
-**Solution**: Move index and control files (which contain dotlock files) to the container's native filesystem (`/tmp`). The actual mail stays on the bind-mounted volume, but all lock/index I/O runs on fast native ext4 inside the container.
-
-**Trade-off**: Index files are lost on container restart and must be rebuilt. This is acceptable for a local development/migration server.
-
-#### 3. Added `fts_autoindex = no`
-
-```ini
-fts_autoindex = no
-```
-
-**Problem**: The built-in `fts.conf` sets `fts_autoindex = yes`, which triggers the `indexer-worker` process asynchronously after every IMAP APPEND. During bulk operations (like `decrypt-smime.py` replacing thousands of messages), the indexer-worker and IMAP process race on `dovecot-uidlist.lock`, causing "dotlock was overridden" errors and failures.
-
-**Solution**: Disable FTS auto-indexing. This directive must appear **after** the `!include_try` lines so it overrides the vendor default in `fts.conf`. Full-text indexing can be triggered manually with `doveadm index` after migration is complete.
-
-#### 4. Added `mail_max_userip_connections = 32`
-
-Raised from the default to support `decrypt-smime.py`'s parallel connection mode (`--connections N`), which opens multiple simultaneous IMAP connections.
-
-### Built-in Config Files (from Image)
-
-These files are baked into the image at build time and loaded via `!include_try conf.d/*.conf`:
-
-#### `conf.d/auth.conf` — Authentication
-
-```ini
-passdb static {
-  password = %{env:USER_PASSWORD}
-}
-```
-
-Uses a static password from the `USER_PASSWORD` environment variable. All usernames are accepted. This is suitable only for local/development use.
-
-#### `conf.d/mail.conf` — Namespace
-
-```ini
-@mailbox_defaults = english
-namespace inbox {
-  separator = /
-}
-```
-
-Sets the IMAP namespace separator to `/`. Note: Dovecot translates between the IMAP separator (`/`) and the Maildir++ physical separator (`.`) automatically when using `mail_driver = maildir`.
-
-#### `conf.d/ssl.conf` — TLS
-
-```ini
-ssl_server {
-  cert_file = /etc/dovecot/ssl/tls.crt
-  key_file = /etc/dovecot/ssl/tls.key
-}
-```
-
-Uses a self-signed "snakeoil" certificate generated during image build. The `decrypt-smime.py` tool is configured to accept self-signed certificates.
-
-#### `conf.d/fts.conf` — Full-Text Search
-
-```ini
-mail_plugins {
-  fts = yes
-  fts_flatcurve = yes
-}
-fts_autoindex = yes
-fts_autoindex_max_recent_msgs = 999
-fts_search_add_missing = yes
-
-fts flatcurve {
-   substring_search = yes
-   commit_limit = 100
-}
-```
-
-Flatcurve (Xapian) FTS is enabled by default in the image. The runtime `dovecot.conf` overrides `fts_autoindex = no` to prevent indexer-worker contention during bulk IMAP operations.
-
-#### `conf.d/mail_log.conf` — Audit Logging
-
-```ini
-mail_plugins {
-  mail_log = yes
-  notify = yes
-}
-mail_log_events = delete undelete expunge save copy mailbox_create mailbox_delete mailbox_rename flag_change
-```
-
-Logs all mailbox-modifying events to stdout. Useful for debugging sync and decryption operations.
-
-#### `conf.d/metrics.conf` — Prometheus Metrics
-
-Configures event exporters and metric collectors for IMAP commands, SMTP/LMTP commands, mail deliveries, and auth failures. Available on the stats HTTP listener (port 9090).
-
-#### `vendor.d/rootless.conf` — Rootless Port Bindings
-
-Maps all services to the 31xxx port range so Dovecot can run as the unprivileged `vmail` user without binding to privileged ports.
-
-### `dovecot-lib.conf`
-
-```
-/dovecot/lib
-```
-
-Added to `/etc/ld.so.conf.d/` so the dynamic linker can find Dovecot's shared libraries at `/dovecot/lib`.
+Supports `decrypt-smime.py`'s parallel connection mode (`--connections N`), which opens multiple simultaneous IMAP connections.
 
 ## How It Integrates with mail-sync
 

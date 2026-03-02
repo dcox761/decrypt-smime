@@ -1,0 +1,13 @@
+# docker-compose.yml
+services:
+  mail-sync:
+    image: mail-sync:1
+    environment:
+      - TZ=Australia/Adelaide
+    volumes:
+      - ./offlineimap.conf:/mnt/config/offlineimap.conf
+      - ./password.conf:/mnt/secret/password.conf
+      - ./write-keywords.sh:/mnt/config/write-keywords.sh
+      - ./offlineimap.py:/mnt/config/.offlineimap.py
+      - ./data:/mnt/mail
+    restart: unless-stopped

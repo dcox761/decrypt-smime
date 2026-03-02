@@ -1,0 +1,11 @@
+services:
+  dovecot:
+    image: dovecot:242
+    environment:
+      - USER_PASSWORD=password
+    ports:
+      - "8143:31143"
+    volumes:
+      - ./dovecot.conf:/etc/dovecot/dovecot.conf
+      - ../mail-sync/data/account:/srv/vmail/user/mail
+    restart: unless-stopped
