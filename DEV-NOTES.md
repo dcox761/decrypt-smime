@@ -1,161 +1,4 @@
-# Decrypt S/MIME Messages
-
-I have recently moved to Stalwart mail server and enabled S/MIME encryption on my account. All my emails were synced with imapsync and transparently encrypted. This has caused problems on iOS intermittently showing `This message has not been downloaded from server` for some messages which can then not be viewed at all. There are lots of possible solutions shown for this issue which do not work reliably.
-
-Outlook does not provide options to configure S/MIME.
-
-Thunderbird works but is also not 100%. It refuses to show images for encrypted messages and always wants to send with encryption by default.
-
-Searching does not work very well and SPAM filtering is possibly affected. At least it is not possible to rebuild each.
-
-I have used offlineimap to sync my Stalwart account to a local Maildir and setup Dovecot in a container to make it available with IMAP protocol. My plan is to decrypt all my messages locally and then transfer back to Stalwart.
-
-## Features
-
-- Detects S/MIME encrypted messages via `Content-Type: application/pkcs7-mime` header analysis
-- Decrypts using `openssl cms -decrypt` with PEM private key files (three-strategy fallback: full SMIME → minimal SMIME wrapper → raw DER payload)
-- Multiple private key support with automatic key-mismatch fallback (`--additional-privatekey`)
-- Handles both encrypted and unencrypted PEM keys (passphrase ignored for unencrypted keys)
-- Connects via IMAP with STARTTLS, accepting self-signed certificates
-- Scans all folders including unsubscribed, or limits to a single folder with `--folder`
-- Count mode (`--count`) to survey encrypted messages without requiring a private key
-- Dryrun mode (`--dryrun`) to validate decryption without modifying the mailbox
-- Preserves all message flags (except `\Deleted` and `\Recent`), headers, and INTERNALDATE
-- Replaces encrypted messages in-place via IMAP APPEND + STORE `\Deleted` + CLOSE expunge
-- Moves failed messages to `.failed` sibling folders with `--move-failures`
-- Continues on errors with `--ignore-failures`, reporting all problems in the summary
-- Graceful Ctrl-C handling: first signal finishes current message, second force-exits
-- Parallel decryption within folders via `--workers` (dual-connection pipeline: reader FETCH → thread pool decrypt → writer APPEND + batch STORE)
-- Parallel folder processing via `--connections` (independent IMAP connections per folder)
-- Live background progress ticker with per-folder and aggregate throughput metrics
-- Debug tracing for every IMAP operation via `--debug`
-- Identifies failed messages with UID, From, Date, and Subject in error output
-- Skips messages already marked `\Deleted` for safe re-runs after interruption
-- Robust handling of malformed email headers (tolerates CR/LF in address fields)
-- Automatic fallback for messages where OpenSSL's SMIME parser fails (e.g. older 2012-era messages with unusual header formatting)
-- Modular [`smime/`](smime/) package separating CLI, IMAP, crypto, and processing concerns
-
-## Requirements
-
-1. provide CLI arguments for host (localhost), port (8143), user (dc), password (password), privatekey, passphrase
-1. use STARTTLS
-1. accept any certificate including self-signed
-1. read ALL folders including unsubscribed, skipping non-selectable folders (`\Noselect`, `\NonExistent`)
-1. optionally limit to a single folder by name
-1. count option to show a count of messages for each folder and count of emails that are still S/MIME encrypted — does not require privatekey
-1. dryrun option to decrypt each message without modifying the mailbox
-1. exit with an error if decryption fails
-1. provide an option to ignore errors even in dryrun mode
-1. provide an option to move failed messages to (a possibly new folder) of the same name with .failed suffix
-1. dryrun should not make any changes including moving failed messages
-1. provide identifying information for any message with decryption errors, eg. date/time, subject, from address
-1. preserve all flags and headers on the message
-1. save the unencrypted version via IMAP APPEND to the same folder
-1. mark the original for deletion with STORE +FLAGS (\Deleted)
-1. message flags should not be changed on existing messages except when deleted
-1. private keys may not be encrypted, ignore passphrase if provided
-1. use Python in ~/.env
-1. handle Ctrl-C nicely
-1. show a nice Exception message if anything goes wrong
-1. additional (multiple extra) privatekey and passphrase options can be provided and should be attempted in order if it looks like the private key is cause if decryption failure, ie. support privatekey/passphrase, privatekey2/passphrase2
-1. only encrypted messages should be replaced
-1. skip deleted messages even if encrypted
-1. CLOSE the folder after processing to expunge all messages marked \Deleted
-1. support parallel decryption within each folder via `--workers`
-1. support parallel folder processing with independent IMAP connections via `--connections`
-1. provide `--debug` option to show timestamped trace output for every IMAP operation
-1. filter `\Recent` from flags before APPEND (server-managed flag per RFC 3501)
-1. filter `\Deleted` from flags before APPEND so decrypted copies are not immediately marked for deletion
-1. quote folder names containing spaces in IMAP APPEND commands
-
-## Clarification
-
-S/MIME detection via Content-Type pkcs7-mime is correct. Key is PEM with optional passphrase. Use Python cryptography library for key validation, openssl cms for decryption. Save means IMAP APPEND to same folder then mark original \Deleted.
-
-## Implementation
-
-The tool is implemented as a thin entry point [`decrypt-smime.py`](decrypt-smime.py) backed by the [`smime/`](smime/) package:
-
-| Module | Responsibility |
-|---|---|
-| [`smime/cli.py`](smime/cli.py) | CLI argument parsing |
-| [`smime/imap.py`](smime/imap.py) | IMAP connection helpers (imapclient-based), folder listing, flag utilities, batch operations |
-| [`smime/crypto.py`](smime/crypto.py) | S/MIME detection, key loading, openssl decryption, message reconstruction |
-| [`smime/processor.py`](smime/processor.py) | Folder scanning, sequential/parallel message processing, IMAP replace/move |
-
-See [`plans/decrypt-smime-plan.md`](plans/decrypt-smime-plan.md) for the full architecture and design.
-
-### CLI Arguments
-
-| Argument | Default | Description |
-|---|---|---|
-| `--host` | `localhost` | IMAP server hostname |
-| `--port` | `8143` | IMAP server port |
-| `--user` | `dc` | Username for authentication |
-| `--password` | `password` | Password for authentication (prompted if empty) |
-| `--privatekey` | — | Path to PEM private key file (required unless `--count`) |
-| `--passphrase` | — | Passphrase to unlock private key (prompted if empty; ignored for unencrypted keys) |
-| `--additional-privatekey` | — | Additional PEM private key file to try if primary key fails (repeatable) |
-| `--additional-passphrase` | — | Passphrase for corresponding additional private key (repeatable) |
-| `--folder` | all folders | Limit to a single folder by name |
-| `--count` | false | Show message counts and encrypted counts per folder |
-| `--dryrun` | false | Attempt decryption but do not modify mailbox |
-| `--ignore-failures` | false | Continue processing even if decryption fails |
-| `--move-failures` | false | Move failed messages to a `.failed` sibling folder |
-| `--workers` | `1` | Number of parallel workers for message decryption per folder |
-| `--connections` | `1` | Number of parallel IMAP connections for folder-level parallelism |
-| `--debug` | false | Print timestamped trace output for every IMAP operation |
-
-### Usage Examples
-
-```bash
-# Count encrypted messages across all folders (no key needed)
-python decrypt-smime.py --count
-
-# Count in a single folder
-python decrypt-smime.py --count --folder INBOX
-
-# Dryrun decryption (validates key works for all messages)
-python decrypt-smime.py --privatekey key.pem --dryrun
-
-# Dryrun with passphrase on command line
-python decrypt-smime.py --privatekey key.pem --passphrase 'mypass' --dryrun
-
-# Dryrun ignoring failures (report all problems without stopping)
-python decrypt-smime.py --privatekey key.pem --dryrun --ignore-failures
-
-# Full decrypt and replace
-python decrypt-smime.py --privatekey key.pem
-
-# Full decrypt, single folder
-python decrypt-smime.py --privatekey key.pem --folder INBOX
-
-# Decrypt with multiple keys (try second key if first fails)
-python decrypt-smime.py --privatekey key1.pem --additional-privatekey key2.pem
-
-# Move failed messages to .failed folders instead of stopping
-python decrypt-smime.py --privatekey key.pem --move-failures
-
-# Combine multiple additional keys and ignore remaining failures
-python decrypt-smime.py --privatekey key1.pem \
-  --additional-privatekey key2.pem --additional-passphrase 'pass2' \
-  --additional-privatekey key3.pem \
-  --ignore-failures
-
-# Decrypt with 32 parallel workers (speeds up large folders)
-python decrypt-smime.py --privatekey key.pem --workers 32
-
-# Process 5 folders in parallel, each with 32 decrypt workers
-python decrypt-smime.py --privatekey key.pem --connections 5 --workers 32
-```
-
-### Dependencies
-
-- Python 3.9+ (uses `ThreadPoolExecutor.shutdown(cancel_futures=True)`, walrus operator `:=` requires 3.8+)
-- `imapclient` — high-level IMAP client with automatic response parsing, folder quoting, and flag handling
-- `cryptography` — PEM key loading and validation
-- `openssl` — CMS decryption via subprocess (`openssl cms -decrypt`)
-- Standard library: `email`, `ssl`, `argparse`, `getpass`, `sys`, `subprocess`, `tempfile`, `signal`, `os`, `time`, `queue`, `threading`, `concurrent.futures`, `itertools`, `dataclasses`, `typing`
+# Development Notes
 
 ## Development Log — 2026-03-01
 
@@ -242,7 +85,7 @@ UIDs are persistent across UNSELECT/SELECT cycles so the pre-fetched UID list re
 
 The `dovecot-uidlist.lock` is always a dotlock regardless of the `lock_method` setting (which was already `fcntl`). This is hardcoded in Dovecot's Maildir implementation.
 
-**Fix**: Move index and control files (which contain the dotlock files) to the container's native filesystem by setting [`mail_index_path`](dovecot.conf:22) and [`mail_control_path`](dovecot.conf:23) in [`dovecot.conf`](dovecot.conf):
+**Fix**: Move index and control files (which contain the dotlock files) to the container's native filesystem by setting `mail_index_path` and `mail_control_path` in `dovecot.conf`:
 ```
 mail_index_path = /tmp/dovecot-index/%{user | lower}
 mail_control_path = /tmp/dovecot-control/%{user | lower}
@@ -261,7 +104,7 @@ This keeps the actual mail on the bind-mounted volume but puts all lock/index op
 
 **Root cause**: `fts_autoindex = yes` in the vendor FTS config triggers the indexer-worker on every APPEND. This is a server-side issue that cannot be solved client-side.
 
-**Fix**: Disable FTS auto-indexing in [`dovecot.conf`](dovecot.conf:98) by adding `fts_autoindex = no` **after** the `!include_try` directives to override the vendor default. The indexer can be triggered manually after migration is complete (`doveadm index`).
+**Fix**: Disable FTS auto-indexing in `dovecot.conf` by adding `fts_autoindex = no` **after** the `!include_try` directives to override the vendor default. The indexer can be triggered manually after migration is complete (`doveadm index`).
 
 **Note**: `process_limit = 0` for `service indexer-worker` was attempted but Dovecot 2.4.2 rejects it: `process_limit must be higher than 0`.
 
@@ -327,9 +170,26 @@ When `--connections > 1`, [`process_folder()`](smime/processor.py:375) receives 
 
 **Note**: The planned refactoring item "Modernise `email.policy`" (switch to `email.policy.default`) has been cancelled — `compat32` is required for compatibility with real-world mail.
 
+#### 15. OpenSSL `SMIME_read_ASN1_ex:no content type` on Older Messages
+
+**Problem**: Some older S/MIME encrypted messages (observed on 2012-era emails from pragmaticbookshelf.com) fail decryption with:
+```
+openssl cms -decrypt failed: Error reading SMIME Content Info
+error:068000D1:asn1 encoding routines:SMIME_read_ASN1_ex:no content type:crypto/asn1/asn_mime.c:422:
+```
+OpenSSL's SMIME reader (`SMIME_read_ASN1_ex`) fails to parse the `Content-Type` header from the full RFC822 message. This can be caused by transport headers (long `Received` chains, unusual folding) confusing the parser, or by older S/MIME implementations using non-standard MIME formatting. The messages display fine in Thunderbird because Thunderbird extracts the PKCS7 payload directly rather than relying on OpenSSL's SMIME parser.
+
+**Fix**: [`decrypt_smime_message()`](smime/crypto.py:237) now uses a three-strategy fallback:
+
+1. **Full message as SMIME** (`-inform SMIME`): Original behaviour, works for most messages.
+2. **Minimal SMIME wrapper** ([`_build_minimal_smime()`](smime/crypto.py:176)): Strips all transport/envelope headers (Received, Return-Path, DKIM, etc.) and keeps only `MIME-Version`, `Content-Type`, `Content-Transfer-Encoding`, and `Content-Disposition` — the only headers OpenSSL's SMIME reader needs. This fixes cases where extra headers confuse `SMIME_read_ASN1_ex`.
+3. **Raw DER payload** ([`_extract_pkcs7_der()`](smime/crypto.py:157)): Extracts the PKCS7 binary payload by parsing the email with Python's `email` module (`get_payload(decode=True)` handles base64 decoding), then passes the raw DER bytes to `openssl cms -decrypt -inform DER`. This bypasses OpenSSL's MIME parsing entirely, similar to how Thunderbird handles it.
+
+The fallback only triggers on `"content type"` / `"no content"` errors. Other errors (wrong key, bad decrypt, corrupted data) propagate immediately without attempting fallback strategies. The shared [`_run_openssl_decrypt()`](smime/crypto.py:211) helper eliminates code duplication across all three strategies.
+
 ### Dovecot Configuration Changes
 
-The following changes to [`dovecot.conf`](dovecot.conf) are required for the decryption tool to work efficiently:
+The following changes to `dovecot.conf` are required for the decryption tool to work efficiently:
 
 ```ini
 # Move index/control files to container-native filesystem (issues #7)
@@ -466,21 +326,4 @@ Replaced ad-hoc dicts with [`MessageRecord`](smime/processor.py:29) `@dataclass`
 
 ~~Switch from `email.policy.compat32` to `email.policy.default` in [`smime/crypto.py`](smime/crypto.py) for cleaner header access.~~
 
-**Cancelled** — see [Known Issue #14](#14-python-312-emailpolicydefault-rejects-crlfin-address-headers) below. `email.policy.default` enforces strict RFC 5322 validation on address headers, which fails on real-world messages containing CR/LF in folded headers. The `compat32` policy is required for compatibility.
-
-#### 15. OpenSSL `SMIME_read_ASN1_ex:no content type` on Older Messages
-
-**Problem**: Some older S/MIME encrypted messages (observed on 2012-era emails from pragmaticbookshelf.com) fail decryption with:
-```
-openssl cms -decrypt failed: Error reading SMIME Content Info
-error:068000D1:asn1 encoding routines:SMIME_read_ASN1_ex:no content type:crypto/asn1/asn_mime.c:422:
-```
-OpenSSL's SMIME reader (`SMIME_read_ASN1_ex`) fails to parse the `Content-Type` header from the full RFC822 message. This can be caused by transport headers (long `Received` chains, unusual folding) confusing the parser, or by older S/MIME implementations using non-standard MIME formatting. The messages display fine in Thunderbird because Thunderbird extracts the PKCS7 payload directly rather than relying on OpenSSL's SMIME parser.
-
-**Fix**: [`decrypt_smime_message()`](smime/crypto.py:237) now uses a three-strategy fallback:
-
-1. **Full message as SMIME** (`-inform SMIME`): Original behaviour, works for most messages.
-2. **Minimal SMIME wrapper** ([`_build_minimal_smime()`](smime/crypto.py:176)): Strips all transport/envelope headers (Received, Return-Path, DKIM, etc.) and keeps only `MIME-Version`, `Content-Type`, `Content-Transfer-Encoding`, and `Content-Disposition` — the only headers OpenSSL's SMIME reader needs. This fixes cases where extra headers confuse `SMIME_read_ASN1_ex`.
-3. **Raw DER payload** ([`_extract_pkcs7_der()`](smime/crypto.py:157)): Extracts the PKCS7 binary payload by parsing the email with Python's `email` module (`get_payload(decode=True)` handles base64 decoding), then passes the raw DER bytes to `openssl cms -decrypt -inform DER`. This bypasses OpenSSL's MIME parsing entirely, similar to how Thunderbird handles it.
-
-The fallback only triggers on `"content type"` / `"no content"` errors. Other errors (wrong key, bad decrypt, corrupted data) propagate immediately without attempting fallback strategies. The shared [`_run_openssl_decrypt()`](smime/crypto.py:211) helper eliminates code duplication across all three strategies.
+**Cancelled** — see [Known Issue #14](#14-python-312-emailpolicydefault-rejects-crlfin-address-headers). `email.policy.default` enforces strict RFC 5322 validation on address headers, which fails on real-world messages containing CR/LF in folded headers. The `compat32` policy is required for compatibility.
