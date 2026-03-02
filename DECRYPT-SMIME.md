@@ -44,7 +44,16 @@ S/MIME detection via Content-Type pkcs7-mime is correct. Key is PEM with passphr
 
 ## Implementation
 
-The tool is implemented in [`decrypt-smime.py`](decrypt-smime.py). See [`plans/decrypt-smime-plan.md`](plans/decrypt-smime-plan.md) for the full architecture and design.
+The tool is implemented as a thin entry point [`decrypt-smime.py`](decrypt-smime.py) backed by the [`smime/`](smime/) package:
+
+| Module | Responsibility |
+|---|---|
+| [`smime/cli.py`](smime/cli.py) | CLI argument parsing |
+| [`smime/imap.py`](smime/imap.py) | IMAP connection, folder listing, FETCH response parsing |
+| [`smime/crypto.py`](smime/crypto.py) | S/MIME detection, key loading, openssl decryption, message reconstruction |
+| [`smime/processor.py`](smime/processor.py) | Folder scanning, sequential/parallel message processing, IMAP replace/move |
+
+See [`plans/decrypt-smime-plan.md`](plans/decrypt-smime-plan.md) for the full architecture and design.
 
 ### CLI Arguments
 
@@ -52,7 +61,7 @@ The tool is implemented in [`decrypt-smime.py`](decrypt-smime.py). See [`plans/d
 |---|---|---|
 | `--host` | `localhost` | IMAP server hostname |
 | `--port` | `8143` | IMAP server port |
-| `--user` | `user` | Username for authentication |
+| `--user` | `dc` | Username for authentication |
 | `--password` | `password` | Password for authentication (prompted if empty) |
 | `--privatekey` | — | Path to PEM private key file (required unless `--count`) |
 | `--passphrase` | — | Passphrase to unlock private key (prompted if empty; ignored for unencrypted keys) |
@@ -63,6 +72,7 @@ The tool is implemented in [`decrypt-smime.py`](decrypt-smime.py). See [`plans/d
 | `--dryrun` | false | Attempt decryption but do not modify mailbox |
 | `--ignore-failures` | false | Continue processing even if decryption fails |
 | `--move-failures` | false | Move failed messages to a `.failed` sibling folder |
+| `--workers` | `1` | Number of parallel workers for message decryption |
 
 ### Usage Examples
 
@@ -99,6 +109,9 @@ python decrypt-smime.py --privatekey key1.pem \
   --additional-privatekey key2.pem --additional-passphrase 'pass2' \
   --additional-privatekey key3.pem \
   --ignore-failures
+
+# Decrypt with 4 parallel workers (speeds up large folders)
+python decrypt-smime.py --privatekey key.pem --workers 4
 ```
 
 ### Dependencies
@@ -231,3 +244,26 @@ fts_autoindex = no
 ```
 
 After making these changes, restart Dovecot: `docker compose restart dovecot`
+
+### Refactoring to `smime/` Package
+
+**Motivation**: The single-file `decrypt-smime.py` grew to ~1170 lines, making it difficult to add parallelism and reason about individual concerns. Folders with thousands of messages need parallel decryption but `imaplib` is not thread-safe, so the architecture must cleanly separate IMAP I/O from CPU/subprocess-bound work.
+
+**New structure**:
+
+| File | Lines | Responsibility |
+|---|---|---|
+| [`decrypt-smime.py`](decrypt-smime.py) | ~200 | Entry point: signal handling, folder iteration, summary |
+| [`smime/cli.py`](smime/cli.py) | ~80 | `argparse` definitions |
+| [`smime/imap.py`](smime/imap.py) | ~190 | All `imaplib` interaction: connect, login, folder ops, FETCH parsing |
+| [`smime/crypto.py`](smime/crypto.py) | ~280 | Key loading, S/MIME detection, `openssl cms` decryption, message reconstruction — **thread-safe** |
+| [`smime/processor.py`](smime/processor.py) | ~370 | Folder scanning, sequential/parallel processing, IMAP replace/move |
+
+**Parallelism design** (`--workers N`):
+
+1. **Scan** (sequential IMAP) → identify encrypted messages
+2. **Fetch** (sequential IMAP) → download full RFC822 bodies
+3. **Decrypt** (parallel `ThreadPoolExecutor`) → openssl subprocess per message, no IMAP I/O
+4. **Replace** (sequential IMAP) → APPEND + STORE per message
+
+Only step 3 runs in parallel. The `decrypt_message()` function in `smime.processor` is explicitly designed with no IMAP dependency so it can safely run in worker threads.
