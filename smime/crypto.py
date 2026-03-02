@@ -29,7 +29,9 @@ def is_smime_encrypted(header_bytes: bytes) -> bool:
     Returns True if Content-Type is application/pkcs7-mime or
     application/x-pkcs7-mime with smime-type=enveloped-data (or smime-type absent).
     """
-    parser = email.parser.BytesParser(policy=email.policy.default)
+    # Use compat32 policy to avoid strict header validation in Python 3.12+
+    # (email.policy.default raises on addresses with CR/LF in folded headers)
+    parser = email.parser.BytesParser(policy=email.policy.compat32)
     msg = parser.parsebytes(header_bytes, headersonly=True)
     content_type = msg.get_content_type()
     if content_type not in ("application/pkcs7-mime", "application/x-pkcs7-mime"):
@@ -49,13 +51,17 @@ def extract_message_info(header_bytes: bytes) -> dict[str, str]:
     Extract identifying information from message headers for error reporting.
     Returns a dict with 'date', 'subject', 'from' keys.
     """
-    parser = email.parser.BytesParser(policy=email.policy.default)
+    # Use compat32 policy to avoid strict header validation in Python 3.12+
+    # (email.policy.default raises on addresses with CR/LF in folded headers)
+    parser = email.parser.BytesParser(policy=email.policy.compat32)
     msg = parser.parsebytes(header_bytes, headersonly=True)
-    return {
-        "date": msg.get("Date", "<no date>"),
-        "subject": msg.get("Subject", "<no subject>"),
-        "from": msg.get("From", "<no from>"),
-    }
+    info = {}
+    for field, key in [("Date", "date"), ("Subject", "subject"), ("From", "from")]:
+        try:
+            info[key] = msg.get(field, f"<no {key}>")
+        except Exception:
+            info[key] = f"<invalid {key} header>"
+    return info
 
 
 def format_message_id(uid: str, info: dict[str, str]) -> str:
@@ -148,12 +154,100 @@ def load_key_chain(args):
 # Decryption
 # ---------------------------------------------------------------------------
 
+def _extract_pkcs7_der(raw_message: bytes) -> bytes:
+    """
+    Extract the PKCS7 DER-encoded payload from an S/MIME email message.
+
+    Parses the email, decodes the body (handling base64/quoted-printable),
+    and returns the raw binary PKCS7 data suitable for ``-inform DER``.
+
+    Raises :class:`RuntimeError` if the payload cannot be extracted.
+    """
+    parser = email.parser.BytesParser(policy=email.policy.compat32)
+    msg = parser.parsebytes(raw_message)
+
+    # decode=True applies Content-Transfer-Encoding (base64 → binary)
+    payload = msg.get_payload(decode=True)
+    if payload is None:
+        raise RuntimeError("Could not extract PKCS7 payload from message")
+    return payload
+
+
+def _build_minimal_smime(raw_message: bytes) -> bytes:
+    """
+    Build a minimal S/MIME message containing only the headers that
+    OpenSSL's SMIME reader needs (Content-Type, Content-Transfer-Encoding,
+    MIME-Version) plus the encoded body.
+
+    This strips transport/envelope headers that can confuse OpenSSL's
+    ``SMIME_read_ASN1_ex`` parser on older or unusually-formatted messages.
+    """
+    parser = email.parser.BytesParser(policy=email.policy.compat32)
+    msg = parser.parsebytes(raw_message)
+
+    # Headers that OpenSSL needs for SMIME parsing
+    smime_headers = []
+    for hdr in ("MIME-Version", "Content-Type", "Content-Transfer-Encoding",
+                "Content-Disposition"):
+        for val in msg.get_all(hdr, []):
+            smime_headers.append(f"{hdr}: {val}")
+
+    if not any(h.lower().startswith("mime-version:") for h in smime_headers):
+        smime_headers.insert(0, "MIME-Version: 1.0")
+
+    # Get the raw body (still base64-encoded, not decoded)
+    payload = msg.get_payload(decode=False)
+    if isinstance(payload, str):
+        body = payload.encode("ascii", errors="replace")
+    elif isinstance(payload, bytes):
+        body = payload
+    else:
+        raise RuntimeError("Could not extract raw payload for minimal SMIME")
+
+    header_block = "\r\n".join(smime_headers).encode("utf-8")
+    return header_block + b"\r\n\r\n" + body
+
+
+def _run_openssl_decrypt(input_path: str, out_path: str, key_path: str,
+                         passphrase: str, inform: str) -> bytes:
+    """
+    Run ``openssl cms -decrypt`` and return the decrypted output.
+
+    Raises :class:`RuntimeError` with the stderr text on failure.
+    """
+    cmd = [
+        "openssl", "cms", "-decrypt",
+        "-inkey", key_path,
+        "-in", input_path,
+        "-inform", inform,
+        "-out", out_path,
+    ]
+    if passphrase:
+        cmd.extend(["-passin", f"pass:{passphrase}"])
+
+    result = subprocess.run(cmd, capture_output=True, timeout=60)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"openssl cms -decrypt failed: {stderr}")
+
+    with open(out_path, "rb") as f:
+        return f.read()
+
+
 def decrypt_smime_message(raw_message: bytes, key_path: str, passphrase: str) -> bytes:
     """
     Decrypt an S/MIME encrypted message.
 
     Uses openssl cms -decrypt via subprocess since the Python cryptography
     library has limited S/MIME/CMS decryption support.
+
+    Attempts three strategies in order:
+
+    1. Pass the full message as ``-inform SMIME`` (works for most messages).
+    2. Build a minimal SMIME wrapper (strips transport headers that confuse
+       OpenSSL's parser) and retry ``-inform SMIME``.
+    3. Extract the raw PKCS7 DER payload and retry with ``-inform DER``
+       (bypasses MIME parsing entirely).
 
     Returns the decrypted message bytes on success.
     Raises an exception on failure.
@@ -162,26 +256,44 @@ def decrypt_smime_message(raw_message: bytes, key_path: str, passphrase: str) ->
         msg_path = os.path.join(tmpdir, "input.eml")
         out_path = os.path.join(tmpdir, "output.eml")
 
+        # --- Strategy 1: full message as SMIME ---
         with open(msg_path, "wb") as f:
             f.write(raw_message)
 
-        cmd = [
-            "openssl", "cms", "-decrypt",
-            "-inkey", key_path,
-            "-in", msg_path,
-            "-inform", "SMIME",
-            "-out", out_path,
-        ]
-        if passphrase:
-            cmd.extend(["-passin", f"pass:{passphrase}"])
+        try:
+            return _run_openssl_decrypt(msg_path, out_path, key_path,
+                                        passphrase, "SMIME")
+        except RuntimeError as exc:
+            first_error = exc
+            err_lower = str(exc).lower()
+            # Only fall through on SMIME-parsing errors
+            if "content type" not in err_lower and "no content" not in err_lower:
+                raise
 
-        result = subprocess.run(cmd, capture_output=True, timeout=60)
-        if result.returncode != 0:
-            stderr = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"openssl cms -decrypt failed: {stderr}")
+        # --- Strategy 2: minimal SMIME wrapper ---
+        try:
+            minimal = _build_minimal_smime(raw_message)
+            minimal_path = os.path.join(tmpdir, "minimal.eml")
+            with open(minimal_path, "wb") as f:
+                f.write(minimal)
+            return _run_openssl_decrypt(minimal_path, out_path, key_path,
+                                        passphrase, "SMIME")
+        except Exception:
+            pass  # fall through to DER
 
-        with open(out_path, "rb") as f:
-            return f.read()
+        # --- Strategy 3: extract DER payload ---
+        try:
+            pkcs7_der = _extract_pkcs7_der(raw_message)
+            der_path = os.path.join(tmpdir, "input.der")
+            with open(der_path, "wb") as f:
+                f.write(pkcs7_der)
+            return _run_openssl_decrypt(der_path, out_path, key_path,
+                                        passphrase, "DER")
+        except RuntimeError:
+            raise
+        except Exception:
+            # If DER extraction itself failed, raise the original error
+            raise first_error
 
 
 def decrypt_with_key_chain(raw_message: bytes, keys: list) -> bytes:

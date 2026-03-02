@@ -13,7 +13,7 @@ I have used offlineimap to sync my Stalwart account to a local Maildir and setup
 ## Features
 
 - Detects S/MIME encrypted messages via `Content-Type: application/pkcs7-mime` header analysis
-- Decrypts using `openssl cms -decrypt` with PEM private key files
+- Decrypts using `openssl cms -decrypt` with PEM private key files (three-strategy fallback: full SMIME → minimal SMIME wrapper → raw DER payload)
 - Multiple private key support with automatic key-mismatch fallback (`--additional-privatekey`)
 - Handles both encrypted and unencrypted PEM keys (passphrase ignored for unencrypted keys)
 - Connects via IMAP with STARTTLS, accepting self-signed certificates
@@ -31,6 +31,8 @@ I have used offlineimap to sync my Stalwart account to a local Maildir and setup
 - Debug tracing for every IMAP operation via `--debug`
 - Identifies failed messages with UID, From, Date, and Subject in error output
 - Skips messages already marked `\Deleted` for safe re-runs after interruption
+- Robust handling of malformed email headers (tolerates CR/LF in address fields)
+- Automatic fallback for messages where OpenSSL's SMIME parser fails (e.g. older 2012-era messages with unusual header formatting)
 - Modular [`smime/`](smime/) package separating CLI, IMAP, crypto, and processing concerns
 
 ## Requirements
@@ -79,7 +81,7 @@ The tool is implemented as a thin entry point [`decrypt-smime.py`](decrypt-smime
 | Module | Responsibility |
 |---|---|
 | [`smime/cli.py`](smime/cli.py) | CLI argument parsing |
-| [`smime/imap.py`](smime/imap.py) | IMAP connection, folder listing, FETCH response parsing |
+| [`smime/imap.py`](smime/imap.py) | IMAP connection helpers (imapclient-based), folder listing, flag utilities, batch operations |
 | [`smime/crypto.py`](smime/crypto.py) | S/MIME detection, key loading, openssl decryption, message reconstruction |
 | [`smime/processor.py`](smime/processor.py) | Folder scanning, sequential/parallel message processing, IMAP replace/move |
 
@@ -152,9 +154,10 @@ python decrypt-smime.py --privatekey key.pem --connections 5 --workers 32
 ### Dependencies
 
 - Python 3.9+ (uses `ThreadPoolExecutor.shutdown(cancel_futures=True)`)
+- `imapclient` — high-level IMAP client with automatic response parsing, folder quoting, and flag handling
 - `cryptography` — PEM key loading and validation
 - `openssl` — CMS decryption via subprocess (`openssl cms -decrypt`)
-- Standard library: `imaplib`, `email`, `ssl`, `argparse`, `getpass`, `re`, `sys`, `subprocess`, `tempfile`, `signal`, `threading`, `concurrent.futures`
+- Standard library: `email`, `ssl`, `argparse`, `getpass`, `sys`, `subprocess`, `tempfile`, `signal`, `threading`, `concurrent.futures`
 
 ## Development Log — 2026-03-01
 
@@ -205,23 +208,17 @@ UIDs are persistent across UNSELECT/SELECT cycles so the pre-fetched UID list re
 
 **Impact**: Extra UNSELECT + SELECT per message adds ~1ms overhead. CLOSE at end expunges all `\Deleted` messages.
 
-#### 2. `imaplib` Unsolicited Response Handling
+#### 2. ~~`imaplib` Unsolicited Response Handling~~ (resolved by imapclient migration)
 
-**Problem**: Python's `imaplib` does not properly consume unsolicited server responses (`* EXISTS`, `* RECENT`, `* EXPUNGE`, `* FLAGS`). These accumulate in `imaplib._untagged_response` and corrupt tagged response matching for subsequent commands.
+**Problem**: Python's `imaplib` did not properly consume unsolicited server responses (`* EXISTS`, `* RECENT`, `* EXPUNGE`, `* FLAGS`). These accumulated in `imaplib._untagged_response` and corrupted tagged response matching for subsequent commands.
 
-**Attempted mitigations that did NOT work**:
-- `conn.noop()` after STORE — only partially drains responses; corruption still occurs after ~10 cycles
-- `conn.noop()` between APPEND and STORE — same issue
-- Re-SELECT between APPEND and STORE — helps but still accumulates junk across cycles
-- Second IMAP connection for APPEND — blocked by Dovecot dotlock contention
+**Resolution**: No longer applicable — `imapclient` handles unsolicited responses correctly. The UNSELECT-before-APPEND pattern (issue #1) is retained because it also addresses Dovecot dotlock contention independently of the IMAP library.
 
-**Working solution**: UNSELECT before APPEND (see issue #1 above)
+#### 3. ~~`imaplib.IMAP4.append()` Requires All 4 Arguments~~ (resolved by imapclient migration)
 
-#### 3. `imaplib.IMAP4.append()` Requires All 4 Arguments
+**Problem**: The original `imaplib`-based code conditionally included `date_time` in the argument list. When `internaldate` was `None`, only 3 arguments were passed — `final_message` (bytes) was interpreted as the `date_time` parameter, causing a `TypeError`.
 
-**Problem**: The original code conditionally included `date_time` in the argument list. When `internaldate` was `None`, only 3 arguments were passed — `final_message` (bytes) was interpreted as the `date_time` parameter, causing a `TypeError` caught by a generic `except` that produced an uninformative "APPEND failed" error.
-
-**Fix**: Always pass all 4 positional arguments to `conn.append(mailbox, flags, date_time, message)`, with `date_time=None` when no internaldate is available (imaplib handles `None` correctly by omitting the date).
+**Resolution**: No longer applicable — `imapclient.append()` uses keyword arguments (`flags=`, `msg_time=`) so argument ordering issues cannot occur.
 
 #### 4. Interrupted Runs Leave `\Deleted` Messages
 
@@ -318,13 +315,19 @@ When `--connections > 1`, [`process_folder()`](smime/processor.py:375) receives 
 
 **Solution**: The `on_scan_complete` callback in [`process_folder()`](smime/processor.py:375) is invoked immediately after the scan phase with `(total_messages, encrypted_count)`. [`_process_one_folder()`](decrypt-smime.py:107) prints scan counts right away (e.g. `Archives/2012: 2742 messages, 126 encrypted`), then prints a separate decrypt result line when the folder finishes (e.g. `Archives/2012: 124 decrypted, 19.7 msg/s`). This gives immediate visibility into which folders have encrypted messages and how many, before decryption even begins.
 
-#### 13. `imaplib.append()` Does Not Quote Folder Names
+#### 13. ~~`imaplib.append()` Does Not Quote Folder Names~~ (resolved by imapclient migration)
 
-**Problem**: Python's `imaplib.IMAP4.append()` passes the mailbox name directly to the IMAP command without quoting. For folders with spaces (e.g. `My Folder`), the server receives `APPEND My Folder (flags) ...` and parses `My` as the mailbox and `Folder` as the next argument, returning `[TRYCREATE] Mailbox doesn't exist: My`. This caused all folders with spaces in their names to silently fail APPEND — the decryption succeeded but the replace loop retried endlessly without ever storing a result.
+**Problem**: Python's `imaplib.IMAP4.append()` passed the mailbox name directly to the IMAP command without quoting. For folders with spaces (e.g. `My Folder`), the server received `APPEND My Folder (flags) ...` and parsed `My` as the mailbox and `Folder` as the next argument, returning `[TRYCREATE] Mailbox doesn't exist: My`.
 
-Note: `imaplib.select()` calls an internal `_checkquote()` helper that auto-quotes names with spaces, but `append()` does not.
+**Resolution**: No longer applicable — `imapclient` quotes folder names correctly in all operations including `append()`, `select_folder()`, and `list_folders()`.
 
-**Fix**: In [`replace_message()`](smime/processor.py:225) and [`move_message_to_failed()`](smime/processor.py:314), try the quoted variant (`"My Folder"`) **first** before the unquoted variant. This ensures folder names with spaces are always properly quoted in the IMAP APPEND command.
+#### 14. Python 3.12+ `email.policy.default` Rejects CR/LF in Address Headers
+
+**Problem**: Python 3.12 introduced strict RFC 5322 validation in `email.policy.default`. When parsing message headers with this policy, accessing address fields (`From`, `To`, etc.) that contain CR or LF characters from folded headers raises `ValueError: invalid arguments; address parts cannot contain CR or LF`. This caused `ERROR processing INBOX: invalid arguments; address parts cannot contain CR or LF` when [`extract_message_info()`](smime/crypto.py:48) or [`is_smime_encrypted()`](smime/crypto.py:25) accessed headers on real-world messages with non-standard folding.
+
+**Fix**: Switched both [`is_smime_encrypted()`](smime/crypto.py:25) and [`extract_message_info()`](smime/crypto.py:48) from `email.policy.default` to `email.policy.compat32`, which does not enforce strict address validation. Additionally, [`extract_message_info()`](smime/crypto.py:48) now wraps each header access in `try/except` so that even if an individual header is malformed, the other fields are still extracted and processing continues with an `<invalid {field} header>` placeholder.
+
+**Note**: The planned refactoring item "Modernise `email.policy`" (switch to `email.policy.default`) has been cancelled — `compat32` is required for compatibility with real-world mail.
 
 ### Dovecot Configuration Changes
 
@@ -343,7 +346,7 @@ After making these changes, restart Dovecot: `docker compose restart dovecot`
 
 ### Refactoring to `smime/` Package
 
-**Motivation**: The single-file `decrypt-smime.py` grew to ~1170 lines, making it difficult to add parallelism and reason about individual concerns. Folders with thousands of messages need parallel decryption but `imaplib` is not thread-safe, so the architecture must cleanly separate IMAP I/O from CPU/subprocess-bound work.
+**Motivation**: The single-file `decrypt-smime.py` grew to ~1170 lines, making it difficult to add parallelism and reason about individual concerns. Folders with thousands of messages need parallel decryption, so the architecture cleanly separates IMAP I/O from CPU/subprocess-bound work.
 
 **New structure**:
 
@@ -351,8 +354,8 @@ After making these changes, restart Dovecot: `docker compose restart dovecot`
 |---|---|---|
 | [`decrypt-smime.py`](decrypt-smime.py) | ~490 | Entry point: signal handling, folder-level parallelism, progress ticker, summary |
 | [`smime/cli.py`](smime/cli.py) | ~60 | `argparse` definitions including `--workers` and `--connections` |
-| [`smime/imap.py`](smime/imap.py) | ~200 | All `imaplib` interaction: connect, login, folder ops, FETCH parsing |
-| [`smime/crypto.py`](smime/crypto.py) | ~300 | Key loading, S/MIME detection, `openssl cms` decryption, message reconstruction — **thread-safe** |
+| [`smime/imap.py`](smime/imap.py) | ~150 | All `imapclient` interaction: connect, login, folder ops, flag utilities, batch operations |
+| [`smime/crypto.py`](smime/crypto.py) | ~450 | Key loading, S/MIME detection, `openssl cms` decryption (with SMIME/DER fallback), message reconstruction — **thread-safe** |
 | [`smime/processor.py`](smime/processor.py) | ~760 | Folder scanning, sequential and pipeline-parallel processing, IMAP replace/move, global decrypted counter |
 
 ### Parallelism Architecture
@@ -417,52 +420,69 @@ Each active folder shows `decrypted/total` so you can see individual folder prog
 
 The ticker is started before the folder pool and stopped in a `finally` block via `_progress_stop` threading Event. It uses `_print_lock` for thread-safe output.
 
-## Planned Refactoring
+## Completed Refactoring
 
-See [`plans/refactor-smime-plan.md`](plans/refactor-smime-plan.md) for the full phased implementation plan.
+See [`plans/refactor-smime-plan.md`](plans/refactor-smime-plan.md) for the original phased implementation plan.
 
 ### Motivation
 
-The codebase has grown to ~1800 lines across 5 files with significant duplication, manual IMAP response parsing, and ad-hoc data structures. Several patterns can be simplified using functional programming idioms, prebuilt libraries, and Python standard library features.
+The original single-file `decrypt-smime.py` grew to ~1170 lines with significant duplication, manual IMAP response parsing via `imaplib`, and ad-hoc data structures. The refactoring simplified the codebase using `imapclient`, functional programming idioms, and Python standard library features.
 
-### Summary of Changes
+### Summary of Completed Changes
 
-#### Migrate from `imaplib` to `imapclient`
+#### ✅ Migrate from `imaplib` to `imapclient`
 
-The single biggest simplification. [`imapclient`](https://imapclient.readthedocs.io/) eliminates ~150 lines of manual IMAP response parsing:
+The single biggest simplification. [`imapclient`](https://imapclient.readthedocs.io/) eliminated ~150 lines of manual IMAP response parsing:
 
-- [`parse_list_response()`](smime/imap.py:55) — replaced by `client.list_folders()`
-- [`decode_modified_utf7()`](smime/imap.py:74) — handled transparently by imapclient
-- [`extract_flags_from_fetch()`](smime/imap.py:158), [`extract_uid_from_fetch()`](smime/imap.py:175), [`extract_internaldate_from_fetch()`](smime/imap.py:189) — FETCH returns pre-parsed dicts with typed values
-- [`format_imap_flags()`](smime/imap.py:203) — `imapclient.append()` accepts flag lists natively
-- Folder quoting workarounds in [`replace_message()`](smime/processor.py:225) and [`move_message_to_failed()`](smime/processor.py:314) — imapclient quotes correctly
+- `parse_list_response()` → replaced by `client.list_folders()`
+- `decode_modified_utf7()` → handled transparently by imapclient
+- `extract_flags_from_fetch()`, `extract_uid_from_fetch()`, `extract_internaldate_from_fetch()` → FETCH returns pre-parsed dicts with typed values
+- `format_imap_flags()` → `imapclient.append()` accepts flag lists natively
+- Folder quoting workarounds → imapclient quotes correctly (resolved Known Issues #2, #3, #13)
 
-The dovecot.conf workarounds for `mail_index_path`, `mail_control_path`, and `fts_autoindex = no` resolve the dotlock contention issues at the server level, making the imapclient migration safe.
+#### ✅ Introduce `MessageRecord` dataclass
 
-#### Introduce `MessageRecord` dataclass
+Replaced ad-hoc dicts with [`MessageRecord`](smime/processor.py:29) `@dataclass`. Provides IDE autocompletion, eliminates dict-key typo risks, and formalises the `label` field.
 
-Replace the ad-hoc dict documented at [`processor.py:63-69`](smime/processor.py:63) with a typed `@dataclass`. Provides IDE autocompletion, eliminates dict-key typo risks, and formalises the `_label` field added in [`_process_parallel()`](smime/processor.py:564).
+#### ✅ Functional pattern refactors
 
-#### Functional pattern refactors
-
-| Pattern | Location | Change |
+| Pattern | Location | Result |
 |---|---|---|
-| filter+map | [`scan_folder()`](smime/processor.py:121) parsing loop | Replace while-loop with `filter(None, map(parse_item, data))` |
-| List comprehensions | [`filter_encrypted()`](smime/processor.py:148) | Replace manual loop+counter with two comprehensions |
-| `itertools.chain` | [`reconstruct_message()`](smime/crypto.py:319) | Collapse three header assembly loops into one chain |
-| Precomputed `frozenset` | [`reconstruct_message()`](smime/crypto.py:334) | Replace O(n) `hdr.lower() in [h.lower() for h in ...]` with O(1) set lookup |
-| `TemporaryDirectory` | [`decrypt_smime_message()`](smime/crypto.py:148) | Replace manual temp file lifecycle with auto-cleaned temp dir |
-| Dict comprehension | [`reconstruct_message()`](smime/crypto.py:302) override_map | Replace loop with `{h.lower(): [...] for h in ... if ...}` using walrus |
+| filter+map | [`scan_folder()`](smime/processor.py:89) | `filter(None, map(_parse_item, data))` replaces while-loop |
+| List comprehensions | [`filter_encrypted()`](smime/processor.py:147) | Two comprehensions replace manual loop+counter |
+| `itertools.chain` | [`reconstruct_message()`](smime/crypto.py:273) | Three header assembly loops collapsed into one chain |
+| Precomputed `frozenset` | [`_ENVELOPE_LOWER`, `_OVERRIDE_LOWER`](smime/crypto.py:269) | O(1) set lookup replaces O(n) list scan |
+| `TemporaryDirectory` | [`decrypt_smime_message()`](smime/crypto.py:237) | Auto-cleaned temp dir replaces manual lifecycle |
+| Dict comprehension | [`reconstruct_message()`](smime/crypto.py:295) override_map | Walrus operator dict comprehension |
 
-#### DRY refactors in orchestration
+#### ✅ DRY refactors in orchestration
 
-| Pattern | Location | Change |
+| Pattern | Location | Result |
 |---|---|---|
-| Shared error handler | [`_process_sequential()`](smime/processor.py:467) and [`_handle_completed()`](smime/processor.py:603) | Extract `_handle_message_outcome()` — ~60 lines of shared decision tree |
-| Shared `clean_flags()` | [`replace_message()`](smime/processor.py:240), [`move_message_to_failed()`](smime/processor.py:326) | Extract to [`smime/imap.py`](smime/imap.py) utility |
-| `_submit_next()` helper | [`decrypt-smime.py`](decrypt-smime.py) lines 337-346, 351-360, 384-390 | Three identical copies → one function |
-| `_accumulate()` helper | [`decrypt-smime.py`](decrypt-smime.py) lines 363-369, 422-428 | Two identical result-accumulation blocks → one function |
+| Shared error handler | [`_handle_message_outcome()`](smime/processor.py:365) | Extracted ~60 lines of shared decision tree |
+| Shared `clean_flags()` | [`clean_flags()`](smime/imap.py:137) | Extracted to [`smime/imap.py`](smime/imap.py) utility |
+| `_submit_next()` helper | [`_submit_next()`](decrypt-smime.py:140) | Three identical copies → one function |
+| `_accumulate()` helper | [`_accumulate()`](decrypt-smime.py:116) | Two identical result-accumulation blocks → one function |
 
-#### Modernise `email.policy`
+#### ~~Modernise `email.policy`~~
 
-Switch from `email.policy.compat32` to `email.policy.default` in [`smime/crypto.py`](smime/crypto.py) for cleaner header access. Requires testing with non-ASCII subjects and multipart messages to verify RFC 2822 output compatibility.
+~~Switch from `email.policy.compat32` to `email.policy.default` in [`smime/crypto.py`](smime/crypto.py) for cleaner header access.~~
+
+**Cancelled** — see [Known Issue #14](#14-python-312-emailpolicydefault-rejects-crlfin-address-headers) below. `email.policy.default` enforces strict RFC 5322 validation on address headers, which fails on real-world messages containing CR/LF in folded headers. The `compat32` policy is required for compatibility.
+
+#### 15. OpenSSL `SMIME_read_ASN1_ex:no content type` on Older Messages
+
+**Problem**: Some older S/MIME encrypted messages (observed on 2012-era emails from pragmaticbookshelf.com) fail decryption with:
+```
+openssl cms -decrypt failed: Error reading SMIME Content Info
+error:068000D1:asn1 encoding routines:SMIME_read_ASN1_ex:no content type:crypto/asn1/asn_mime.c:422:
+```
+OpenSSL's SMIME reader (`SMIME_read_ASN1_ex`) fails to parse the `Content-Type` header from the full RFC822 message. This can be caused by transport headers (long `Received` chains, unusual folding) confusing the parser, or by older S/MIME implementations using non-standard MIME formatting. The messages display fine in Thunderbird because Thunderbird extracts the PKCS7 payload directly rather than relying on OpenSSL's SMIME parser.
+
+**Fix**: [`decrypt_smime_message()`](smime/crypto.py:237) now uses a three-strategy fallback:
+
+1. **Full message as SMIME** (`-inform SMIME`): Original behaviour, works for most messages.
+2. **Minimal SMIME wrapper** ([`_build_minimal_smime()`](smime/crypto.py:176)): Strips all transport/envelope headers (Received, Return-Path, DKIM, etc.) and keeps only `MIME-Version`, `Content-Type`, `Content-Transfer-Encoding`, and `Content-Disposition` — the only headers OpenSSL's SMIME reader needs. This fixes cases where extra headers confuse `SMIME_read_ASN1_ex`.
+3. **Raw DER payload** ([`_extract_pkcs7_der()`](smime/crypto.py:157)): Extracts the PKCS7 binary payload by parsing the email with Python's `email` module (`get_payload(decode=True)` handles base64 decoding), then passes the raw DER bytes to `openssl cms -decrypt -inform DER`. This bypasses OpenSSL's MIME parsing entirely, similar to how Thunderbird handles it.
+
+The fallback only triggers on `"content type"` / `"no content"` errors. Other errors (wrong key, bad decrypt, corrupted data) propagate immediately without attempting fallback strategies. The shared [`_run_openssl_decrypt()`](smime/crypto.py:211) helper eliminates code duplication across all three strategies.
