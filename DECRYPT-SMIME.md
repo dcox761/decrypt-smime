@@ -37,12 +37,10 @@ I have used offlineimap to sync my Stalwart account to a local Maildir and setup
 
 ## Requirements
 
-Refer to list-all-flags.py for an example program that checks messages in all folders (including unsubscribed) and shows a list of flags in use.
-
 1. provide CLI arguments for host (localhost), port (8143), user (dc), password (password), privatekey, passphrase
 1. use STARTTLS
 1. accept any certificate including self-signed
-1. read ALL folders including unsubscribed
+1. read ALL folders including unsubscribed, skipping non-selectable folders (`\Noselect`, `\NonExistent`)
 1. optionally limit to a single folder by name
 1. count option to show a count of messages for each folder and count of emails that are still S/MIME encrypted — does not require privatekey
 1. dryrun option to decrypt each message without modifying the mailbox
@@ -72,7 +70,7 @@ Refer to list-all-flags.py for an example program that checks messages in all fo
 
 ## Clarification
 
-S/MIME detection via Content-Type pkcs7-mime is correct. Key is PEM with passphrase. Use Python cryptography library for key validation, openssl cms for decryption. Save means IMAP APPEND to same folder then mark original \Deleted.
+S/MIME detection via Content-Type pkcs7-mime is correct. Key is PEM with optional passphrase. Use Python cryptography library for key validation, openssl cms for decryption. Save means IMAP APPEND to same folder then mark original \Deleted.
 
 ## Implementation
 
@@ -153,11 +151,11 @@ python decrypt-smime.py --privatekey key.pem --connections 5 --workers 32
 
 ### Dependencies
 
-- Python 3.9+ (uses `ThreadPoolExecutor.shutdown(cancel_futures=True)`)
+- Python 3.9+ (uses `ThreadPoolExecutor.shutdown(cancel_futures=True)`, walrus operator `:=` requires 3.8+)
 - `imapclient` — high-level IMAP client with automatic response parsing, folder quoting, and flag handling
 - `cryptography` — PEM key loading and validation
 - `openssl` — CMS decryption via subprocess (`openssl cms -decrypt`)
-- Standard library: `email`, `ssl`, `argparse`, `getpass`, `sys`, `subprocess`, `tempfile`, `signal`, `threading`, `concurrent.futures`
+- Standard library: `email`, `ssl`, `argparse`, `getpass`, `sys`, `subprocess`, `tempfile`, `signal`, `os`, `time`, `queue`, `threading`, `concurrent.futures`, `itertools`, `dataclasses`, `typing`
 
 ## Development Log — 2026-03-01
 

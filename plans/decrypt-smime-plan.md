@@ -120,10 +120,11 @@ Detection uses `BODY.PEEK[HEADER]` to avoid setting the `\Seen` flag, then parse
 
 ## Dependencies
 
-- Python 3.8+
+- Python 3.9+ (uses `ThreadPoolExecutor.shutdown(cancel_futures=True)`)
+- `imapclient` — high-level IMAP client with automatic response parsing, folder quoting, and flag handling
 - `cryptography` — PEM key loading and validation
 - `openssl` — CMS decryption via subprocess (`openssl cms -decrypt`)
-- Standard library: `imaplib`, `email`, `ssl`, `argparse`, `getpass`, `re`, `sys`, `subprocess`, `tempfile`, `signal`
+- Standard library: `email`, `ssl`, `argparse`, `getpass`, `sys`, `subprocess`, `tempfile`, `signal`, `os`, `time`, `queue`, `threading`, `concurrent.futures`, `itertools`, `dataclasses`, `typing`
 
 ## Files
 

@@ -1,0 +1,2 @@
+imapclient>=3.0
+cryptography>=42.0
