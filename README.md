@@ -132,6 +132,12 @@ See the [`plans/`](plans/) directory for architecture and design documents:
 - [`parallel-pipeline-plan.md`](plans/parallel-pipeline-plan.md) — dual-connection parallel pipeline design
 - [`refactor-smime-plan.md`](plans/refactor-smime-plan.md) — modular package refactoring plan
 
+See the [`docs/`](docs/) directory for reference documentation on the supporting infrastructure:
+
+- [`docs/decrypt-smime.md`](docs/decrypt-smime.md) — tool architecture, processing modes, and performance
+- [`docs/mail-sync.md`](docs/mail-sync.md) — offlineimap Docker container for IMAP-to-Maildir sync
+- [`docs/dovecot.md`](docs/dovecot.md) — Dovecot 2.4.2 Docker build and configuration
+
 ## Security Notes
 
 - The tool accepts any certificate including self-signed ones (designed for local Dovecot instances)
