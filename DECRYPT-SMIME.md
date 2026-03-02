@@ -72,7 +72,9 @@ See [`plans/decrypt-smime-plan.md`](plans/decrypt-smime-plan.md) for the full ar
 | `--dryrun` | false | Attempt decryption but do not modify mailbox |
 | `--ignore-failures` | false | Continue processing even if decryption fails |
 | `--move-failures` | false | Move failed messages to a `.failed` sibling folder |
-| `--workers` | `1` | Number of parallel workers for message decryption |
+| `--workers` | `1` | Number of parallel workers for message decryption per folder |
+| `--connections` | `1` | Number of parallel IMAP connections for folder-level parallelism |
+| `--debug` | false | Print timestamped trace output for every IMAP operation |
 
 ### Usage Examples
 
@@ -110,16 +112,19 @@ python decrypt-smime.py --privatekey key1.pem \
   --additional-privatekey key3.pem \
   --ignore-failures
 
-# Decrypt with 4 parallel workers (speeds up large folders)
-python decrypt-smime.py --privatekey key.pem --workers 4
+# Decrypt with 32 parallel workers (speeds up large folders)
+python decrypt-smime.py --privatekey key.pem --workers 32
+
+# Process 5 folders in parallel, each with 32 decrypt workers
+python decrypt-smime.py --privatekey key.pem --connections 5 --workers 32
 ```
 
 ### Dependencies
 
-- Python 3.8+
+- Python 3.9+ (uses `ThreadPoolExecutor.shutdown(cancel_futures=True)`)
 - `cryptography` — PEM key loading and validation
 - `openssl` — CMS decryption via subprocess (`openssl cms -decrypt`)
-- Standard library: `imaplib`, `email`, `ssl`, `argparse`, `getpass`, `re`, `sys`, `subprocess`, `tempfile`, `signal`
+- Standard library: `imaplib`, `email`, `ssl`, `argparse`, `getpass`, `re`, `sys`, `subprocess`, `tempfile`, `signal`, `threading`, `concurrent.futures`
 
 ## Development Log — 2026-03-01
 
@@ -128,12 +133,16 @@ python decrypt-smime.py --privatekey key.pem --workers 4
 1. **`--ignore-failures`** — continues processing when decryption fails; logs errors with message identification (UID, From, Date, Subject) and reports them in the summary; exit code is non-zero if any failures occurred
 2. **`--move-failures`** — moves failed messages to a `.failed` sibling folder (e.g. `INBOX` → `INBOX.failed`), creating the folder if needed; implies continuing on decryption errors
 3. **`--additional-privatekey` / `--additional-passphrase`** — repeatable options to specify multiple PEM key files; on decryption failure with the primary key, additional keys are tried in order if the error looks like a key-mismatch (heuristic based on openssl error message)
-4. **Unencrypted key support** — [`load_private_key()`](decrypt-smime.py:300) tries loading without a passphrase first; if the key is unencrypted, the passphrase argument is ignored
-5. **Message identification on errors** — [`extract_message_info()`](decrypt-smime.py:269) and [`format_message_id()`](decrypt-smime.py:282) extract From, Date, Subject from headers for all error messages
-6. **Ctrl-C handling** — SIGINT handler ([`_handle_sigint()`](decrypt-smime.py:31)) sets a flag on first interrupt to finish the current message gracefully; second interrupt forces exit
+4. **Unencrypted key support** — [`load_private_key()`](smime/crypto.py) tries loading without a passphrase first; if the key is unencrypted, the passphrase argument is ignored
+5. **Message identification on errors** — [`extract_message_info()`](smime/crypto.py) and [`format_message_id()`](smime/crypto.py) extract From, Date, Subject from headers for all error messages
+6. **Ctrl-C handling** — see [Ctrl-C / Signal Handling](#9-ctrl-c--signal-handling) below
 7. **Dryrun safety** — dryrun mode makes no mailbox modifications at all: no APPEND, no STORE, no folder creation, no moves
 8. **Skip `\Deleted` messages** — messages already marked `\Deleted` (e.g. from a previous interrupted run) are skipped to allow safe re-runs
 9. **`--debug` flag** — prints timestamped trace output for every IMAP operation to diagnose performance issues
+10. **`--workers N`** — parallel decryption within each folder via pipeline architecture (see [Parallelism Architecture](#parallelism-architecture))
+11. **`--connections N`** — folder-level parallelism with independent IMAP connections (see [Parallelism Architecture](#parallelism-architecture))
+12. **Background progress ticker** — live throughput display every 3 seconds with active folder list when `--connections > 1`
+13. **Per-folder and overall throughput metrics** — msg/s rate in progress output, per-folder breakdown, and wall-clock rate in summary
 
 ### Known Issues and Workarounds
 
@@ -187,19 +196,19 @@ UIDs are persistent across UNSELECT/SELECT cycles so the pre-fetched UID list re
 
 **Problem**: If the script is interrupted (Ctrl-C, crash, or hung connection) after APPEND but before the user runs EXPUNGE, the folder contains both the decrypted copy and the original (marked `\Deleted`). On the next run, the original would be decrypted again, creating a duplicate.
 
-**Fix**: Messages with `\Deleted` in their flags are skipped ([line 751](decrypt-smime.py:751)). Additionally, `\Deleted` is stripped from flags when APPENDing decrypted copies so the new message doesn't inherit the delete marker.
+**Fix**: Messages with `\Deleted` in their flags are skipped. Additionally, `\Deleted` is stripped from flags when APPENDing decrypted copies so the new message doesn't inherit the delete marker.
 
 #### 5. Flags Preserved Including `\Deleted` from Original
 
 **Problem**: The decrypted APPEND was copying all original flags including `\Deleted`, so the new decrypted message was immediately marked for deletion.
 
-**Fix**: `\Deleted` is filtered out of the flags list before APPEND ([line 862](decrypt-smime.py:862)).
+**Fix**: `\Deleted` is filtered out of the flags list before APPEND.
 
 #### 6. `\Recent` Flag Rejected by APPEND
 
 **Problem**: Dovecot rejects APPEND commands that include the `\Recent` system flag: `BAD [Error in IMAP command APPEND: Invalid system flag \RECENT]`. Per RFC 3501, `\Recent` is a server-managed flag — only the server can set it; clients cannot include it in APPEND.
 
-**Fix**: Both APPEND paths (main decrypt at [line 868](decrypt-smime.py:868) and [`move_message_to_failed()`](decrypt-smime.py:625)) now filter out `\Recent` from the flags list before building the APPEND flags string.
+**Fix**: Both APPEND paths (main decrypt and [`move_message_to_failed()`](smime/processor.py)) now filter out `\Recent` from the flags list before building the APPEND flags string.
 
 #### 7. VirtioFS Dotlock Performance
 
@@ -230,6 +239,48 @@ This keeps the actual mail on the bind-mounted volume but puts all lock/index op
 
 **Note**: `process_limit = 0` for `service indexer-worker` was attempted but Dovecot 2.4.2 rejects it: `process_limit must be higher than 0`.
 
+#### 9. Ctrl-C / Signal Handling
+
+**Problem**: Python's `ThreadPoolExecutor` registers an atexit handler (`_python_exit()`) that calls `thread.join()` on all worker threads. This means `sys.exit()` blocks indefinitely when pool threads are still running — even after `shutdown(wait=False)`.
+
+**Solution — three layers**:
+
+1. **First Ctrl-C** — [`_handle_sigint()`](decrypt-smime.py:41) sets `_interrupted` flag via [`set_interrupted()`](smime/processor.py:24). All processing loops check this flag and stop after completing the current in-progress message. Pending `ThreadPoolExecutor` futures are cancelled.
+
+2. **Second Ctrl-C** — calls `os._exit(130)` to terminate immediately, bypassing atexit handlers and stuck thread joins.
+
+3. **Normal exit** — [`main()`](decrypt-smime.py) uses `os._exit(exit_code)` instead of `sys.exit()` to avoid blocking on atexit handlers from lingering thread pool threads (both folder-level and inner decrypt-worker pools).
+
+**Additional measures for `--connections > 1`**:
+- Folder-level pool uses explicit `pool.shutdown(wait=False, cancel_futures=True)` instead of context manager (`with ThreadPoolExecutor()` calls `shutdown(wait=True)` in `__exit__`)
+- Each `_process_one_folder()` worker checks `is_interrupted()` at the very top before connecting to IMAP, so queued futures bail out immediately
+- Inner decrypt worker pools in [`_process_parallel()`](smime/processor.py) also use `pool.shutdown(wait=False)`
+
+#### 10. Parallel Output Management
+
+**Problem**: With `--connections > 1`, multiple threads writing per-message `\r` progress updates garble the terminal output. Interleaved `Processing:` headers and result lines from different folders are hard to read.
+
+**Solution — `quiet_progress` flag**:
+
+When `--connections > 1`, [`process_folder()`](smime/processor.py:375) receives `quiet_progress=True` which suppresses:
+- Per-message `\r` progress updates (e.g. `[25/238] 28.6 msg/s — UID 25: decrypted`)
+- "Processing N encrypted messages with M workers ..." banner
+- "Stopping early due to interrupt" messages (one per connection)
+- Final `print(flush=True)` newline after `\r` progress
+
+**What IS shown with `--connections > 1`**:
+- `Processing: FolderName ...` header for each folder (thread-safe via `_print_lock`)
+- Per-folder result line with msg/s rate (only for folders with encrypted messages)
+- Background ticker every 3 seconds showing aggregate throughput and active folder names
+- Error messages for decryption failures
+- Summary with wall-clock time, overall rate, and per-connection rate
+
+#### 11. Active Folder Tracking
+
+**Problem**: The background progress ticker needs to show which folders are actively being processed. Naively tracking from the start of `_process_one_folder()` shows folders that are still connecting or scanning (no encrypted messages) as "active".
+
+**Solution**: The `on_decrypt_start` callback in [`process_folder()`](smime/processor.py:375) is invoked only when encrypted messages are found and decryption is about to begin. [`decrypt-smime.py`](decrypt-smime.py) passes `on_decrypt_start=lambda: _add_active_folder(display_name)` so the folder only appears in the active set during actual decryption work. `_remove_active_folder()` in the `finally` block removes it when done (safe no-op if never added).
+
 ### Dovecot Configuration Changes
 
 The following changes to [`dovecot.conf`](dovecot.conf) are required for the decryption tool to work efficiently:
@@ -253,17 +304,64 @@ After making these changes, restart Dovecot: `docker compose restart dovecot`
 
 | File | Lines | Responsibility |
 |---|---|---|
-| [`decrypt-smime.py`](decrypt-smime.py) | ~200 | Entry point: signal handling, folder iteration, summary |
-| [`smime/cli.py`](smime/cli.py) | ~80 | `argparse` definitions |
-| [`smime/imap.py`](smime/imap.py) | ~190 | All `imaplib` interaction: connect, login, folder ops, FETCH parsing |
-| [`smime/crypto.py`](smime/crypto.py) | ~280 | Key loading, S/MIME detection, `openssl cms` decryption, message reconstruction — **thread-safe** |
-| [`smime/processor.py`](smime/processor.py) | ~370 | Folder scanning, sequential/parallel processing, IMAP replace/move |
+| [`decrypt-smime.py`](decrypt-smime.py) | ~490 | Entry point: signal handling, folder-level parallelism, progress ticker, summary |
+| [`smime/cli.py`](smime/cli.py) | ~60 | `argparse` definitions including `--workers` and `--connections` |
+| [`smime/imap.py`](smime/imap.py) | ~200 | All `imaplib` interaction: connect, login, folder ops, FETCH parsing |
+| [`smime/crypto.py`](smime/crypto.py) | ~300 | Key loading, S/MIME detection, `openssl cms` decryption, message reconstruction — **thread-safe** |
+| [`smime/processor.py`](smime/processor.py) | ~760 | Folder scanning, sequential and pipeline-parallel processing, IMAP replace/move, global decrypted counter |
 
-**Parallelism design** (`--workers N`):
+### Parallelism Architecture
 
-1. **Scan** (sequential IMAP) → identify encrypted messages
-2. **Fetch** (sequential IMAP) → download full RFC822 bodies
-3. **Decrypt** (parallel `ThreadPoolExecutor`) → openssl subprocess per message, no IMAP I/O
-4. **Replace** (sequential IMAP) → APPEND + STORE per message
+**Thread safety design**:
+- [`smime/crypto.py`](smime/crypto.py) functions are **thread-safe** (no IMAP I/O, only `openssl` subprocesses and in-memory operations)
+- [`smime/imap.py`](smime/imap.py) functions are **NOT thread-safe** (all use single `imaplib` connection)
+- Each parallel folder connection gets its own `imaplib.IMAP4` instance
 
-Only step 3 runs in parallel. The `decrypt_message()` function in `smime.processor` is explicitly designed with no IMAP dependency so it can safely run in worker threads.
+**Two-level parallelism**:
+
+1. **`--connections N`** — folder-level parallelism: N folders processed simultaneously, each on its own IMAP connection. Safe because Dovecot dotlocks are per-folder, so different folders have independent locks.
+   - Folders submitted incrementally (not all at once) so Ctrl-C stops new submissions immediately
+   - Completed futures batch-drained to keep pool saturated and active-folder list accurate
+   - Background ticker thread prints aggregate throughput every 3 seconds
+
+2. **`--workers N`** — within each folder, a pipeline overlaps IMAP I/O with parallel decryption:
+   - Main thread fetches message from IMAP → submits to `ThreadPoolExecutor` for decryption
+   - When pool reaches `workers` in-flight futures, drains completed results → does IMAP replace
+   - Net effect: up to `workers` openssl subprocesses run concurrently while main thread does IMAP I/O
+   - Memory bounded to ~`workers` full messages per folder connection
+
+Both levels can be combined: `--connections 5 --workers 32` runs 5 folders in parallel, each with 32 decrypt workers (160 openssl subprocesses peak).
+
+**Throughput metrics**: 
+- Background ticker every 3s: `⏱ 253 decrypted, 9s elapsed, 28.1 msg/s  [active: Archives/2012, Sent]`
+- Per-folder result: `Sent: 11487 messages, 10721 encrypted, 10721 decrypted, 33.5 msg/s`
+- Summary: wall-clock time, overall rate, per-connection rate
+
+**Performance observed** (Dovecot 2.4.2 on Docker with VirtioFS, Mac mini M4):
+
+| Configuration | Rate | Notes |
+|---|---|---|
+| `--workers 1` (sequential) | ~4.3 msg/s | Baseline, single connection |
+| `--workers 10` | ~10 msg/s | 2.3× speedup |
+| `--workers 32` | ~32 msg/s | 7.4× speedup |
+| `--connections 5 --workers 32` | ~28-33 msg/s | Folder-level parallelism |
+
+The bottleneck at higher worker counts is the sequential IMAP replace phase (UNSELECT → APPEND → SELECT → STORE per message, ~30-230ms each depending on VirtioFS latency). Workers help by overlapping openssl subprocess time with IMAP I/O. Multiple connections help when there are many folders to process, reducing total wall-clock time.
+
+### Global Decrypted Counter
+
+A thread-safe global counter in [`smime/processor.py`](smime/processor.py) (`_global_decrypted` with `threading.Lock`) is incremented at every successful decryption across all connections. This powers the background ticker in [`decrypt-smime.py`](decrypt-smime.py) without requiring cross-thread communication of per-folder results.
+
+Functions: [`_increment_global_decrypted()`](smime/processor.py), [`get_global_decrypted()`](smime/processor.py), [`reset_global_decrypted()`](smime/processor.py).
+
+### Background Progress Ticker
+
+When `--connections > 1`, a daemon thread [`_progress_ticker()`](decrypt-smime.py) prints aggregate throughput every 3 seconds:
+
+```
+⏱ 253 decrypted, 9s elapsed, 28.1 msg/s  [active: Archives/2012, Sent]
+```
+
+The active folder list shows only folders currently in the decrypt phase (not scanning or connecting), tracked via [`_active_folders`](decrypt-smime.py) set with add/remove callbacks through [`on_decrypt_start`](smime/processor.py:375) parameter.
+
+The ticker is started before the folder pool and stopped in a `finally` block via `_progress_stop` threading Event. It uses `_print_lock` for thread-safe output.

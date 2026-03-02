@@ -7,6 +7,7 @@ Orchestrates scanning folders for encrypted messages, decrypting them
 
 import imaplib
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -30,6 +31,32 @@ def set_interrupted():
 def is_interrupted():
     """Return whether an interrupt has been requested."""
     return _interrupted
+
+
+# ---------------------------------------------------------------------------
+# Global decrypted-message counter (thread-safe, for live throughput display)
+# ---------------------------------------------------------------------------
+
+_global_decrypted = 0
+_global_counter_lock = threading.Lock()
+
+
+def _increment_global_decrypted():
+    """Increment the global decrypted counter (thread-safe)."""
+    global _global_decrypted
+    with _global_counter_lock:
+        _global_decrypted += 1
+
+
+def get_global_decrypted():
+    """Return the current global decrypted count."""
+    return _global_decrypted
+
+
+def reset_global_decrypted():
+    """Reset the global decrypted counter to zero."""
+    global _global_decrypted
+    _global_decrypted = 0
 
 
 # ---------------------------------------------------------------------------
@@ -346,12 +373,17 @@ def move_message_to_failed(conn, folder_name, uid, raw_message,
 
 def process_folder(conn, folder_name, display_name, keys,
                    count_only, dryrun, ignore_failures, move_failures,
-                   debug=False, workers=1):
+                   debug=False, workers=1, quiet_progress=False,
+                   on_decrypt_start=None):
     """
     Process a single folder: detect and optionally decrypt S/MIME messages.
 
     *keys* is a list of (key_path, passphrase) tuples.
     *workers* controls how many parallel decryption threads to use.
+    *quiet_progress* suppresses per-message ``\\r`` progress output
+    (used when multiple connections print simultaneously).
+    *on_decrypt_start* is an optional callback invoked when encrypted
+    messages are found and decryption is about to begin.
 
     Returns ``(total_messages, encrypted_count, decrypted_count,
     failed_count, error_list, elapsed_secs)``.
@@ -377,24 +409,28 @@ def process_folder(conn, folder_name, display_name, keys,
     if count_only or encrypted_count == 0:
         return msg_count, encrypted_count, 0, 0, [], time.time() - _t0
 
+    # Notify caller that decryption is about to start
+    if on_decrypt_start is not None:
+        on_decrypt_start()
+
     # --- Fetch + Decrypt + Replace phase ---
     decrypted_count = 0
     failed_count = 0
     errors = []
 
     if workers > 1:
-        # Parallel path: batch-fetch, parallel decrypt, sequential replace
+        # Parallel path: pipeline decrypt, sequential replace
         decrypted_count, failed_count, errors = _process_parallel(
             conn, folder_name, encrypted_msgs, keys,
             dryrun, ignore_failures, move_failures,
-            workers, dbg,
+            workers, dbg, quiet_progress,
         )
     else:
         # Sequential path (original behaviour)
         decrypted_count, failed_count, errors = _process_sequential(
             conn, folder_name, encrypted_msgs, keys,
             dryrun, ignore_failures, move_failures,
-            dbg,
+            dbg, quiet_progress,
         )
 
     # Expunge \Deleted messages at end of folder
@@ -414,7 +450,8 @@ def process_folder(conn, folder_name, display_name, keys,
 # ---------------------------------------------------------------------------
 
 def _process_sequential(conn, folder_name, encrypted_msgs, keys,
-                        dryrun, ignore_failures, move_failures, dbg):
+                        dryrun, ignore_failures, move_failures, dbg,
+                        quiet_progress=False):
     """Process encrypted messages one at a time. Returns (decrypted, failed, errors)."""
     decrypted_count = 0
     failed_count = 0
@@ -422,7 +459,9 @@ def _process_sequential(conn, folder_name, encrypted_msgs, keys,
 
     for idx, msg in enumerate(encrypted_msgs, 1):
         if _interrupted:
-            print("\n  Stopping early due to interrupt.", file=sys.stderr)
+            if not quiet_progress:
+                print("\n  Stopping early due to interrupt.",
+                      file=sys.stderr)
             break
 
         uid = msg["uid"]
@@ -476,9 +515,11 @@ def _process_sequential(conn, folder_name, encrypted_msgs, keys,
         dbg(f"[{idx}] Decrypted OK, final size: "
             f"{len(msg['final_message'])} bytes")
         decrypted_count += 1
+        _increment_global_decrypted()
 
         if dryrun:
-            print(f"    UID {uid}: decryption OK (dryrun, not replacing)")
+            if not quiet_progress:
+                print(f"    UID {uid}: decryption OK (dryrun, not replacing)")
             continue
 
         # Replace via IMAP
@@ -492,7 +533,8 @@ def _process_sequential(conn, folder_name, encrypted_msgs, keys,
                 continue
             return decrypted_count, failed_count, [error_msg]
 
-        print(f"    UID {uid}: decrypted and replaced")
+        if not quiet_progress:
+            print(f"    UID {uid}: decrypted and replaced")
         dbg(f"[{idx}] Done with UID {uid}")
 
     return decrypted_count, failed_count, errors
@@ -504,7 +546,7 @@ def _process_sequential(conn, folder_name, encrypted_msgs, keys,
 
 def _process_parallel(conn, folder_name, encrypted_msgs, keys,
                       dryrun, ignore_failures, move_failures,
-                      workers, dbg):
+                      workers, dbg, quiet_progress=False):
     """
     Pipeline-parallel processing: overlap IMAP fetch/replace with
     concurrent decryption in a thread pool.
@@ -527,8 +569,9 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
     errors = []
     total = len(encrypted_msgs)
 
-    print(f"    Processing {total} encrypted messages "
-          f"with {workers} workers ...", flush=True)
+    if not quiet_progress:
+        print(f"    Processing {total} encrypted messages "
+              f"with {workers} workers ...", flush=True)
 
     # Pre-compute labels (cheap — only header parsing)
     for msg in encrypted_msgs:
@@ -576,14 +619,16 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
             return False, error_msg
 
         decrypted_count += 1
+        _increment_global_decrypted()
         processed += 1
         elapsed = time.time() - _t0
         rate = processed / elapsed if elapsed > 0 else 0
 
         if dryrun:
-            print(f"\r    [{processed}/{total}] {rate:.1f} msg/s — "
-                  f"UID {uid}: decryption OK (dryrun)          ",
-                  flush=True)
+            if not quiet_progress:
+                print(f"\r    [{processed}/{total}] {rate:.1f} msg/s — "
+                      f"UID {uid}: decryption OK (dryrun)          ",
+                      flush=True)
             return True, None
 
         err = replace_message(conn, folder_name, msg, dbg)
@@ -596,9 +641,10 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
                 return True, None
             return False, error_msg
 
-        print(f"\r    [{processed}/{total}] {rate:.1f} msg/s — "
-              f"UID {uid}: decrypted and replaced          ",
-              end="", flush=True)
+        if not quiet_progress:
+            print(f"\r    [{processed}/{total}] {rate:.1f} msg/s — "
+                  f"UID {uid}: decrypted and replaced          ",
+                  end="", flush=True)
         dbg(f"Done with UID {uid}")
 
         # Free memory
@@ -649,8 +695,9 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
     try:
         for msg in encrypted_msgs:
             if _interrupted:
-                print("\n  Stopping early due to interrupt.",
-                      file=sys.stderr)
+                if not quiet_progress:
+                    print("\n  Stopping early due to interrupt.",
+                          file=sys.stderr)
                 break
 
             uid = msg["uid"]
@@ -693,8 +740,9 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
         if not fatal_error:
             while futures:
                 if _interrupted:
-                    print("\n  Stopping early due to interrupt.",
-                          file=sys.stderr)
+                    if not quiet_progress:
+                        print("\n  Stopping early due to interrupt.",
+                              file=sys.stderr)
                     break
                 fatal = _drain_completed(futures, pool, block=True)
                 if fatal:
@@ -707,7 +755,7 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
             f.cancel()
         pool.shutdown(wait=False)
 
-    if processed > 0:
+    if processed > 0 and not quiet_progress:
         print(flush=True)  # newline after \r progress
 
     if fatal_error:

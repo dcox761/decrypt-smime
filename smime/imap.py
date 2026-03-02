@@ -16,25 +16,29 @@ import sys
 # Connection
 # ---------------------------------------------------------------------------
 
-def connect_to_server(host, port):
+def connect_to_server(host, port, quiet=False):
     """Connect to the IMAP server with STARTTLS and return the connection."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    print(f"Connecting to {host}:{port}...")
+    if not quiet:
+        print(f"Connecting to {host}:{port}...")
     conn = imaplib.IMAP4(host, port)
-    print("Upgrading connection with STARTTLS...")
+    if not quiet:
+        print("Upgrading connection with STARTTLS...")
     conn.starttls(ssl_context=ctx)
     return conn
 
 
-def login(conn, user, password):
+def login(conn, user, password, quiet=False):
     """Authenticate against the IMAP server.  Exits on failure."""
     try:
-        print(f"Logging in as {user}...")
+        if not quiet:
+            print(f"Logging in as {user}...")
         conn.login(user, password)
-        print("Login successful.")
+        if not quiet:
+            print("Login successful.")
     except imaplib.IMAP4.error as exc:
         print(f"ERROR: Login failed: {exc}", file=sys.stderr)
         try:

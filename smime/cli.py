@@ -76,4 +76,8 @@ def parse_args():
         "--workers", type=int, default=1,
         help="Number of parallel workers for message decryption (default: 1)",
     )
+    parser.add_argument(
+        "--connections", type=int, default=1,
+        help="Number of parallel IMAP connections for folder-level parallelism (default: 1)",
+    )
     return parser.parse_args()
