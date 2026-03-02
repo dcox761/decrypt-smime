@@ -4,148 +4,66 @@ IMAP Account Inspector
 
 Connects to an IMAP server, lists all available folders,
 and collects all flags used throughout the account.
+
+Requires: imapclient (pip install imapclient)
 """
 
-import imaplib
 import argparse
 import getpass
-import re
 import ssl
 import sys
-import base64
+
+from imapclient import IMAPClient
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Connect to an IMAP server, list folders, and collect all flags."
     )
-    parser.add_argument("--host", required=True, help="IMAP server hostname")
+    parser.add_argument("--host", default="localhost", help="IMAP server hostname (default: localhost)")
     parser.add_argument(
-        "--port", type=int, default=993, help="IMAP server port (default: 993)"
+        "--port", type=int, default=8143, help="IMAP server port (default: 8143)"
     )
-    parser.add_argument("--user", required=True, help="Username for authentication")
+    parser.add_argument("--user", default="dc", help="Username for authentication (default: dc)")
     parser.add_argument(
         "--password",
-        default="",
-        help="Password for authentication (prompted if empty)",
+        default="password",
+        help="Password for authentication (default: password, prompted if empty)",
     )
-    parser.add_argument(
-        "--no-ssl",
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--ssl",
         action="store_true",
-        help="Use plain IMAP instead of IMAP over SSL",
+        help="Use IMAP over SSL instead of STARTTLS",
     )
-    parser.add_argument(
-        "--starttls",
+    mode.add_argument(
+        "--plain",
         action="store_true",
-        help="Use STARTTLS after connecting on plain port",
+        help="Use plain IMAP (no encryption)",
     )
     return parser.parse_args()
 
 
-def parse_list_response(line):
-    """Parse a single LIST response line into (flags, delimiter, name) or None."""
-    if isinstance(line, tuple):
-        line = b" ".join(part for part in line if isinstance(part, bytes))
-    if not isinstance(line, bytes):
-        return None
-    pattern = rb'\((?P<flags>.*?)\)\s+"(?P<delimiter>.*)"\s+(?P<name>.+)\s*$'
-    match = re.match(pattern, line)
-    if not match:
-        return None
-    flags = match.group("flags").decode("utf-8", errors="replace")
-    delimiter = match.group("delimiter").decode("utf-8", errors="replace")
-    name_raw = match.group("name").strip()
-    if name_raw.startswith(b'"') and name_raw.endswith(b'"'):
-        name_raw = name_raw[1:-1]
-    name = name_raw.decode("utf-8", errors="replace")
-    return flags, delimiter, name
+def connect_to_server(host, port, use_ssl, use_plain):
+    """Connect to the IMAP server and return an IMAPClient instance."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
 
+    if use_ssl:
+        print(f"Connecting to {host}:{port} using SSL...")
+        client = IMAPClient(host, port, ssl=True, ssl_context=ctx)
+    elif use_plain:
+        print(f"Connecting to {host}:{port} (plain, no encryption)...")
+        client = IMAPClient(host, port, ssl=False)
+    else:
+        # Default: STARTTLS
+        print(f"Connecting to {host}:{port}...")
+        client = IMAPClient(host, port, ssl=False)
+        print("Upgrading connection with STARTTLS...")
+        client.starttls(ssl_context=ctx)
 
-def decode_modified_utf7(s):
-    """Decode IMAP modified UTF-7 folder names for display."""
-    result = []
-    i = 0
-    while i < len(s):
-        if s[i] == "&":
-            if i + 1 < len(s) and s[i + 1] == "-":
-                result.append("&")
-                i += 2
-            else:
-                end = s.find("-", i + 1)
-                if end == -1:
-                    result.append(s[i:])
-                    break
-                encoded = s[i + 1 : end].replace(",", "/")
-                try:
-                    padding = (4 - len(encoded) % 4) % 4
-                    decoded_bytes = base64.b64decode(encoded + "=" * padding)
-                    result.append(decoded_bytes.decode("utf-16-be"))
-                except Exception:
-                    result.append(s[i : end + 1])
-                i = end + 1
-        else:
-            result.append(s[i])
-            i += 1
-    return "".join(result)
-
-
-
-def get_all_folders(conn):
-    """List all folders using the LIST command (all folders, not just subscribed)."""
-    status, data = conn.list()
-    if status != "OK":
-        print(f"ERROR: LIST command failed: {status}", file=sys.stderr)
-        return []
-    folders = []
-    for item in data:
-        if item is None:
-            continue
-        parsed = parse_list_response(item)
-        if parsed:
-            folders.append(parsed)
-    return folders
-
-
-def extract_flags_from_fetch_line(line):
-    """Extract a set of flag strings from a FETCH FLAGS response line."""
-    flags = set()
-    if isinstance(line, tuple):
-        line = b" ".join(part for part in line if isinstance(part, bytes))
-    if not isinstance(line, bytes):
-        return flags
-    match = re.search(rb"FLAGS\s*\(([^)]*)\)", line)
-    if match:
-        raw = match.group(1).decode("utf-8", errors="replace").strip()
-        if raw:
-            for flag in raw.split():
-                flag = flag.strip()
-                if flag:
-                    flags.add(flag)
-    return flags
-
-
-def extract_select_flags(conn):
-    """Extract FLAGS and PERMANENTFLAGS from the most recent SELECT response."""
-    flags = set()
-    for resp_name in ("FLAGS", "PERMANENTFLAGS"):
-        try:
-            _, resp_data = conn.response(resp_name)
-            if resp_data:
-                for item in resp_data:
-                    if item is None:
-                        continue
-                    raw = item if isinstance(item, bytes) else str(item).encode()
-                    match = re.search(rb"\(([^)]*)\)", raw)
-                    if match:
-                        text = match.group(1).decode("utf-8", errors="replace").strip()
-                        if text:
-                            for f in text.split():
-                                f = f.strip()
-                                if f:
-                                    flags.add(f)
-        except Exception:
-            pass
-    return flags
+    return client
 
 
 def collect_flags_from_folder(conn, folder_name):
@@ -157,35 +75,34 @@ def collect_flags_from_folder(conn, folder_name):
       - message_flags: flags actually set on individual messages
       - message_count: number of messages in the folder
     """
+    try:
+        select_info = conn.select_folder(folder_name, readonly=True)
+    except Exception:
+        return set(), set(), 0
+
+    msg_count = select_info.get(b"EXISTS", 0)
+
+    # Extract FLAGS and PERMANENTFLAGS from SELECT response
     defined_flags = set()
+    for key in (b"FLAGS", b"PERMANENTFLAGS"):
+        for flag in select_info.get(key, ()):
+            defined_flags.add(
+                flag.decode("ascii", errors="replace")
+                if isinstance(flag, bytes) else str(flag)
+            )
+
+    # Fetch flags from all messages
     message_flags = set()
-
-    selected = False
-    for name_variant in (folder_name, f'"{folder_name}"'):
-        try:
-            status, data = conn.select(name_variant, readonly=True)
-            if status == "OK":
-                selected = True
-                break
-        except imaplib.IMAP4.error:
-            continue
-
-    if not selected:
-        return defined_flags, message_flags, 0
-
-    msg_count = int(data[0]) if data and data[0] else 0
-
-    defined_flags = extract_select_flags(conn)
-
     if msg_count > 0:
         try:
-            status, fetch_data = conn.fetch("1:*", "(FLAGS)")
-            if status == "OK" and fetch_data:
-                for item in fetch_data:
-                    if item is None:
-                        continue
-                    message_flags |= extract_flags_from_fetch_line(item)
-        except imaplib.IMAP4.error as exc:
+            fetch_data = conn.fetch("1:*", ["FLAGS"])
+            for msg_id, data in fetch_data.items():
+                for flag in data.get(b"FLAGS", ()):
+                    message_flags.add(
+                        flag.decode("ascii", errors="replace")
+                        if isinstance(flag, bytes) else str(flag)
+                    )
+        except Exception as exc:
             print(f"    WARNING: FETCH failed: {exc}")
 
     return defined_flags, message_flags, msg_count
@@ -193,28 +110,6 @@ def collect_flags_from_folder(conn, folder_name):
 
 def print_separator(char="=", length=70):
     print(char * length)
-
-def connect_to_server(host, port, use_ssl, use_starttls):
-    """Connect to the IMAP server and return the connection object."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    if use_starttls:
-        actual_port = port if port != 993 else 143
-        print(f"Connecting to {host}:{actual_port}...")
-        conn = imaplib.IMAP4(host, actual_port)
-        print("Upgrading connection with STARTTLS...")
-        conn.starttls(ssl_context=ctx)
-    elif use_ssl:
-        print(f"Connecting to {host}:{port} using SSL...")
-        conn = imaplib.IMAP4_SSL(host, port, ssl_context=ctx)
-    else:
-        actual_port = port if port != 993 else 143
-        print(f"Connecting to {host}:{actual_port} (plain, no encryption)...")
-        conn = imaplib.IMAP4(host, actual_port)
-
-    return conn
 
 
 def main():
@@ -224,19 +119,18 @@ def main():
     if not password:
         password = getpass.getpass(f"Password for {args.user}@{args.host}: ")
 
-    use_ssl = not args.no_ssl and not args.starttls
-
     try:
-        conn = connect_to_server(args.host, args.port, use_ssl, args.starttls)
+        conn = connect_to_server(args.host, args.port, args.ssl, args.plain)
     except Exception as exc:
-        print(f"ERROR: Could not connect to {args.host}:{args.port}: {exc}", file=sys.stderr)
+        print(f"ERROR: Could not connect to {args.host}:{args.port}: {exc}",
+              file=sys.stderr)
         sys.exit(1)
 
     try:
         print(f"Logging in as {args.user}...")
         conn.login(args.user, password)
         print("Login successful.")
-    except imaplib.IMAP4.error as exc:
+    except Exception as exc:
         print(f"ERROR: Login failed: {exc}", file=sys.stderr)
         conn.logout()
         sys.exit(1)
@@ -244,7 +138,7 @@ def main():
     print_separator()
     print("Listing all folders (LIST command)...")
     print_separator()
-    folders = get_all_folders(conn)
+    folders = conn.list_folders()
 
     if not folders:
         print("No folders found.")
@@ -253,10 +147,11 @@ def main():
 
     print(f"\nFound {len(folders)} folder(s):\n")
     for folder_flags, delimiter, folder_name in folders:
-        display_name = decode_modified_utf7(folder_name)
-        print(f"  [{folder_flags}]  {display_name}")
-        if display_name != folder_name:
-            print(f"      (raw: {folder_name})")
+        flags_str = ", ".join(
+            f.decode("ascii", errors="replace") if isinstance(f, bytes) else str(f)
+            for f in folder_flags
+        )
+        print(f"  [{flags_str}]  {folder_name}")
 
     print_separator()
     print("Scanning all folders for flags...")
@@ -267,16 +162,21 @@ def main():
     total_messages = 0
     folder_details = []
 
-    for folder_flags_str, delimiter, folder_name in folders:
-        if "\\Noselect" in folder_flags_str or "\\NonExistent" in folder_flags_str:
-            display_name = decode_modified_utf7(folder_name)
-            print(f"\n  Skipping non-selectable folder: {display_name}")
+    for folder_flags, delimiter, folder_name in folders:
+        # Skip non-selectable folders
+        flag_strs = {
+            (f.decode("ascii", errors="replace") if isinstance(f, bytes) else str(f))
+            for f in folder_flags
+        }
+        if "\\Noselect" in flag_strs or "\\NonExistent" in flag_strs:
+            print(f"\n  Skipping non-selectable folder: {folder_name}")
             continue
 
-        display_name = decode_modified_utf7(folder_name)
-        print(f"\n  Scanning: {display_name} ... ", end="", flush=True)
+        print(f"\n  Scanning: {folder_name} ... ", end="", flush=True)
 
-        defined_flags, message_flags, msg_count = collect_flags_from_folder(conn, folder_name)
+        defined_flags, message_flags, msg_count = collect_flags_from_folder(
+            conn, folder_name
+        )
 
         all_defined_flags |= defined_flags
         all_message_flags |= message_flags
@@ -285,16 +185,12 @@ def main():
         print(f"{msg_count} messages, {len(message_flags)} distinct flag(s) in use")
 
         folder_details.append({
-            "name": display_name,
+            "name": folder_name,
             "msg_count": msg_count,
             "defined_flags": defined_flags,
             "message_flags": message_flags,
         })
 
-    try:
-        conn.close()
-    except Exception:
-        pass
     conn.logout()
     print("\nDisconnected from server.")
 
@@ -306,14 +202,14 @@ def main():
     print(f"\nTotal folders scanned: {len(folder_details)}")
     print(f"Total messages across all folders: {total_messages}")
 
-    print(f"\n--- Server-Defined Flags (from SELECT responses) ---")
+    print("\n--- Server-Defined Flags (from SELECT responses) ---")
     if all_defined_flags:
         for flag in sorted(all_defined_flags, key=str.lower):
             print(f"  {flag}")
     else:
         print("  (none)")
 
-    print(f"\n--- Flags Actually Set on Messages ---")
+    print("\n--- Flags Actually Set on Messages ---")
     if all_message_flags:
         for flag in sorted(all_message_flags, key=str.lower):
             print(f"  {flag}")
@@ -321,7 +217,7 @@ def main():
         print("  (none)")
 
     all_flags = all_defined_flags | all_message_flags
-    print(f"\n--- All Unique Flags (combined) ---")
+    print("\n--- All Unique Flags (combined) ---")
     if all_flags:
         for flag in sorted(all_flags, key=str.lower):
             source_parts = []
@@ -333,7 +229,7 @@ def main():
     else:
         print("  (none)")
 
-    print(f"\n--- Per-Folder Breakdown ---")
+    print("\n--- Per-Folder Breakdown ---")
     for detail in folder_details:
         print(f"\n  {detail['name']} ({detail['msg_count']} messages)")
         if detail["message_flags"]:
