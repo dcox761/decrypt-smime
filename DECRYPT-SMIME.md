@@ -10,6 +10,29 @@ Searching does not work very well and SPAM filtering is possibly affected. At le
 
 I have used offlineimap to sync my Stalwart account to a local Maildir and setup Dovecot in a container to make it available with IMAP protocol. My plan is to decrypt all my messages locally and then transfer back to Stalwart.
 
+## Features
+
+- Detects S/MIME encrypted messages via `Content-Type: application/pkcs7-mime` header analysis
+- Decrypts using `openssl cms -decrypt` with PEM private key files
+- Multiple private key support with automatic key-mismatch fallback (`--additional-privatekey`)
+- Handles both encrypted and unencrypted PEM keys (passphrase ignored for unencrypted keys)
+- Connects via IMAP with STARTTLS, accepting self-signed certificates
+- Scans all folders including unsubscribed, or limits to a single folder with `--folder`
+- Count mode (`--count`) to survey encrypted messages without requiring a private key
+- Dryrun mode (`--dryrun`) to validate decryption without modifying the mailbox
+- Preserves all message flags (except `\Deleted` and `\Recent`), headers, and INTERNALDATE
+- Replaces encrypted messages in-place via IMAP APPEND + STORE `\Deleted` + CLOSE expunge
+- Moves failed messages to `.failed` sibling folders with `--move-failures`
+- Continues on errors with `--ignore-failures`, reporting all problems in the summary
+- Graceful Ctrl-C handling: first signal finishes current message, second force-exits
+- Parallel decryption within folders via `--workers` (pipeline: IMAP fetch → thread pool decrypt → IMAP replace)
+- Parallel folder processing via `--connections` (independent IMAP connections per folder)
+- Live background progress ticker with per-folder and aggregate throughput metrics
+- Debug tracing for every IMAP operation via `--debug`
+- Identifies failed messages with UID, From, Date, and Subject in error output
+- Skips messages already marked `\Deleted` for safe re-runs after interruption
+- Modular [`smime/`](smime/) package separating CLI, IMAP, crypto, and processing concerns
+
 ## Requirements
 
 Refer to list-all-flags.py for an example program that checks messages in all folders (including unsubscribed) and shows a list of flags in use.
@@ -37,6 +60,13 @@ Refer to list-all-flags.py for an example program that checks messages in all fo
 1. additional (multiple extra) privatekey and passphrase options can be provided and should be attempted in order if it looks like the private key is cause if decryption failure, ie. support privatekey/passphrase, privatekey2/passphrase2
 1. only encrypted messages should be replaced
 1. skip deleted messages even if encrypted
+1. CLOSE the folder after processing to expunge all messages marked \Deleted
+1. support parallel decryption within each folder via `--workers`
+1. support parallel folder processing with independent IMAP connections via `--connections`
+1. provide `--debug` option to show timestamped trace output for every IMAP operation
+1. filter `\Recent` from flags before APPEND (server-managed flag per RFC 3501)
+1. filter `\Deleted` from flags before APPEND so decrypted copies are not immediately marked for deletion
+1. quote folder names containing spaces in IMAP APPEND commands
 
 ## Clarification
 
@@ -270,16 +300,30 @@ When `--connections > 1`, [`process_folder()`](smime/processor.py:375) receives 
 
 **What IS shown with `--connections > 1`**:
 - `Processing: FolderName ...` header for each folder (thread-safe via `_print_lock`)
-- Per-folder result line with msg/s rate (only for folders with encrypted messages)
+- Per-folder result line showing total messages and encrypted count for every folder (plus decrypted count and msg/s rate for folders with encrypted messages)
 - Background ticker every 3 seconds showing aggregate throughput and active folder names
 - Error messages for decryption failures
-- Summary with wall-clock time, overall rate, and per-connection rate
+- Summary with wall-clock time, overall rate, per-connection rate, and per-folder breakdown for all processed folders
 
 #### 11. Active Folder Tracking
 
 **Problem**: The background progress ticker needs to show which folders are actively being processed. Naively tracking from the start of `_process_one_folder()` shows folders that are still connecting or scanning (no encrypted messages) as "active".
 
-**Solution**: The `on_decrypt_start` callback in [`process_folder()`](smime/processor.py:375) is invoked only when encrypted messages are found and decryption is about to begin. [`decrypt-smime.py`](decrypt-smime.py) passes `on_decrypt_start=lambda: _add_active_folder(display_name)` so the folder only appears in the active set during actual decryption work. `_remove_active_folder()` in the `finally` block removes it when done (safe no-op if never added).
+**Solution**: The `on_decrypt_start` callback in [`process_folder()`](smime/processor.py:375) is invoked only when encrypted messages are found and decryption is about to begin, passing the encrypted count. [`decrypt-smime.py`](decrypt-smime.py) passes `on_decrypt_start=lambda enc: _add_active_folder(display_name, enc)` so the folder only appears in the active dict during actual decryption work, along with its total encrypted count for progress tracking. `_remove_active_folder()` in the `finally` block removes it when done (safe no-op if never added).
+
+#### 12. Immediate Scan Results Visibility
+
+**Problem**: With `--connections > 1`, per-folder scan counts (total messages, encrypted count) were only printed after the entire folder finished processing. Folders with encrypted messages that took a long time to decrypt would show in the `[active:]` ticker but with no context about how many messages they had. This made it unclear whether a folder had work to do or was just slow.
+
+**Solution**: The `on_scan_complete` callback in [`process_folder()`](smime/processor.py:375) is invoked immediately after the scan phase with `(total_messages, encrypted_count)`. [`_process_one_folder()`](decrypt-smime.py:107) prints scan counts right away (e.g. `Archives/2012: 2742 messages, 126 encrypted`), then prints a separate decrypt result line when the folder finishes (e.g. `Archives/2012: 124 decrypted, 19.7 msg/s`). This gives immediate visibility into which folders have encrypted messages and how many, before decryption even begins.
+
+#### 13. `imaplib.append()` Does Not Quote Folder Names
+
+**Problem**: Python's `imaplib.IMAP4.append()` passes the mailbox name directly to the IMAP command without quoting. For folders with spaces (e.g. `My Folder`), the server receives `APPEND My Folder (flags) ...` and parses `My` as the mailbox and `Folder` as the next argument, returning `[TRYCREATE] Mailbox doesn't exist: My`. This caused all folders with spaces in their names to silently fail APPEND — the decryption succeeded but the replace loop retried endlessly without ever storing a result.
+
+Note: `imaplib.select()` calls an internal `_checkquote()` helper that auto-quotes names with spaces, but `append()` does not.
+
+**Fix**: In [`replace_message()`](smime/processor.py:225) and [`move_message_to_failed()`](smime/processor.py:314), try the quoted variant (`"My Folder"`) **first** before the unquoted variant. This ensures folder names with spaces are always properly quoted in the IMAP APPEND command.
 
 ### Dovecot Configuration Changes
 
@@ -332,10 +376,11 @@ After making these changes, restart Dovecot: `docker compose restart dovecot`
 
 Both levels can be combined: `--connections 5 --workers 32` runs 5 folders in parallel, each with 32 decrypt workers (160 openssl subprocesses peak).
 
-**Throughput metrics**: 
-- Background ticker every 3s: `⏱ 253 decrypted, 9s elapsed, 28.1 msg/s  [active: Archives/2012, Sent]`
-- Per-folder result: `Sent: 11487 messages, 10721 encrypted, 10721 decrypted, 33.5 msg/s`
-- Summary: wall-clock time, overall rate, per-connection rate
+**Throughput metrics**:
+- Background ticker every 3s with per-folder progress: `⏱ 253 decrypted, 9s elapsed, 28.1 msg/s  [Archives/2012 50/126, Sent 200/10721]`
+- Per-folder scan result (immediate): `Drafts: 112 messages, 0 encrypted` or `Sent: 11487 messages, 10721 encrypted`
+- Per-folder decrypt result (on completion): `Sent: 10721 decrypted, 33.5 msg/s`
+- Summary per-folder breakdown shows all processed folders with total + encrypted counts
 
 **Performance observed** (Dovecot 2.4.2 on Docker with VirtioFS, Mac mini M4):
 
@@ -344,7 +389,7 @@ Both levels can be combined: `--connections 5 --workers 32` runs 5 folders in pa
 | `--workers 1` (sequential) | ~4.3 msg/s | Baseline, single connection |
 | `--workers 10` | ~10 msg/s | 2.3× speedup |
 | `--workers 32` | ~32 msg/s | 7.4× speedup |
-| `--connections 5 --workers 32` | ~28-33 msg/s | Folder-level parallelism |
+| `--connections 5 --workers 32` | ~47 msg/s | Folder-level parallelism |
 
 The bottleneck at higher worker counts is the sequential IMAP replace phase (UNSELECT → APPEND → SELECT → STORE per message, ~30-230ms each depending on VirtioFS latency). Workers help by overlapping openssl subprocess time with IMAP I/O. Multiple connections help when there are many folders to process, reducing total wall-clock time.
 
@@ -356,12 +401,15 @@ Functions: [`_increment_global_decrypted()`](smime/processor.py), [`get_global_d
 
 ### Background Progress Ticker
 
-When `--connections > 1`, a daemon thread [`_progress_ticker()`](decrypt-smime.py) prints aggregate throughput every 3 seconds:
+When `--connections > 1`, a daemon thread [`_progress_ticker()`](decrypt-smime.py) prints aggregate throughput every 3 seconds with per-folder progress:
 
 ```
-⏱ 253 decrypted, 9s elapsed, 28.1 msg/s  [active: Archives/2012, Sent]
+⏱ 253 decrypted, 9s elapsed, 28.1 msg/s  [Archives/2012 50/126, Sent 200/10721]
 ```
 
-The active folder list shows only folders currently in the decrypt phase (not scanning or connecting), tracked via [`_active_folders`](decrypt-smime.py) set with add/remove callbacks through [`on_decrypt_start`](smime/processor.py:375) parameter.
+Each active folder shows `decrypted/total` so you can see individual folder progress and identify which folders are making headway. The active folder dict is tracked via [`_active_folders`](decrypt-smime.py) with callbacks:
+- [`on_decrypt_start`](smime/processor.py:375) — adds folder with encrypted count when decryption begins
+- [`on_message_decrypted`](smime/processor.py:375) — increments per-folder decrypted counter after each successful decrypt
+- `_remove_active_folder()` in the `finally` block removes the folder when done
 
 The ticker is started before the folder pool and stopped in a `finally` block via `_progress_stop` threading Event. It uses `_print_lock` for thread-safe output.

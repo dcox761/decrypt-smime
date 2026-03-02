@@ -68,17 +68,23 @@ def print_separator(char="=", length=70):
 
 _progress_stop = threading.Event()
 _active_folders_lock = threading.Lock()
-_active_folders = set()
+_active_folders = {}  # name → {"total": N, "decrypted": 0}
 
 
-def _add_active_folder(name):
+def _add_active_folder(name, total):
     with _active_folders_lock:
-        _active_folders.add(name)
+        _active_folders[name] = {"total": total, "decrypted": 0}
+
+
+def _update_active_folder(name):
+    with _active_folders_lock:
+        if name in _active_folders:
+            _active_folders[name]["decrypted"] += 1
 
 
 def _remove_active_folder(name):
     with _active_folders_lock:
-        _active_folders.discard(name)
+        _active_folders.pop(name, None)
 
 
 def _progress_ticker(wall_t0, interval=3.0):
@@ -90,13 +96,18 @@ def _progress_ticker(wall_t0, interval=3.0):
             elapsed = time.time() - wall_t0
             rate = count / elapsed if elapsed > 0 else 0
             with _active_folders_lock:
-                active = sorted(_active_folders)
-            active_str = ", ".join(active) if active else "—"
+                parts = []
+                for name in sorted(_active_folders):
+                    info = _active_folders[name]
+                    parts.append(
+                        f"{name} {info['decrypted']}/{info['total']}"
+                    )
+            active_str = ", ".join(parts) if parts else "—"
             with _print_lock:
                 print(f"    ⏱ {count} decrypted, "
                       f"{elapsed:.0f}s elapsed, "
                       f"{rate:.1f} msg/s  "
-                      f"[active: {active_str}]", flush=True)
+                      f"[{active_str}]", flush=True)
             last_count = count
 
 
@@ -133,6 +144,12 @@ def _process_one_folder(folder_info, args, keys, password):
     with _print_lock:
         print(f"\n  {mode_label}: {display_name} ...", flush=True)
 
+    # Callback to print scan results immediately after scanning
+    def _on_scan_complete(total, enc):
+        with _print_lock:
+            print(f"  {display_name}: "
+                  f"{total} messages, {enc} encrypted", flush=True)
+
     conn = None
     try:
         # Each folder gets its own connection (quiet to avoid noisy output)
@@ -147,7 +164,11 @@ def _process_one_folder(folder_info, args, keys, password):
             debug=args.debug,
             workers=args.workers,
             quiet_progress=quiet,
-            on_decrypt_start=lambda: _add_active_folder(display_name),
+            on_decrypt_start=lambda enc: _add_active_folder(
+                display_name, enc),
+            on_message_decrypted=lambda: _update_active_folder(
+                display_name),
+            on_scan_complete=_on_scan_complete,
         )
     finally:
         _remove_active_folder(display_name)
@@ -174,24 +195,15 @@ def _process_one_folder(folder_info, args, keys, password):
         "errors": errors,
     }
 
-    # Print per-folder result
-    with _print_lock:
-        if args.count:
-            # Always show counts (that's the whole point of --count)
-            print(f"  {display_name}: "
-                  f"{msg_count} messages, {encrypted} encrypted")
-        elif encrypted > 0:
-            parts = [f"{msg_count} messages",
-                     f"{encrypted} encrypted",
-                     f"{decrypted} decrypted"]
+    # Print per-folder decrypt result (scan counts already printed by callback)
+    if not args.count and encrypted > 0:
+        with _print_lock:
+            parts = [f"{decrypted} decrypted"]
             if failed > 0:
                 parts.append(f"{failed} failed")
             if rate > 0:
                 parts.append(f"{rate:.1f} msg/s")
             print(f"  {display_name}: {', '.join(parts)}")
-        elif not quiet:
-            # Only show "none encrypted" in sequential mode
-            print(f"    {msg_count} messages, none encrypted")
 
     return result
 
@@ -456,20 +468,18 @@ def main():
         if args.dryrun:
             print("\n(dryrun mode — no messages were modified)")
 
-    if args.count or total_encrypted_all > 0:
+    if folder_summaries:
         print(f"\n--- Per-Folder Breakdown ---")
         for summary in folder_summaries:
-            if summary["encrypted"] > 0 or args.count:
-                line = f"  {summary['name']}: {summary['total']} messages"
-                if summary["encrypted"] > 0:
-                    line += f", {summary['encrypted']} encrypted"
-                    if not args.count:
-                        line += f", {summary['decrypted']} decrypted"
-                    if summary.get("failed", 0) > 0:
-                        line += f", {summary['failed']} failed"
-                    if summary.get("rate", 0) > 0:
-                        line += f", {summary['rate']:.1f} msg/s"
-                print(line)
+            line = (f"  {summary['name']}: {summary['total']} messages, "
+                    f"{summary['encrypted']} encrypted")
+            if not args.count and summary["encrypted"] > 0:
+                line += f", {summary['decrypted']} decrypted"
+                if summary.get("failed", 0) > 0:
+                    line += f", {summary['failed']} failed"
+                if summary.get("rate", 0) > 0:
+                    line += f", {summary['rate']:.1f} msg/s"
+            print(line)
 
     if all_errors:
         print(f"\n--- Errors ({len(all_errors)}) ---")

@@ -260,7 +260,7 @@ def replace_message(conn, folder_name, msg_record, debug_fn=None):
                  f"size={len(final_message)}")
     appended = False
     last_err = None
-    for name_variant in (folder_name, f'"{folder_name}"'):
+    for name_variant in (f'"{folder_name}"', folder_name):
         try:
             status, resp = conn.append(
                 name_variant, flags_str, date_str, final_message
@@ -338,7 +338,7 @@ def move_message_to_failed(conn, folder_name, uid, raw_message,
     # APPEND to .failed folder
     date_str = f'"{internaldate}"' if internaldate else None
     appended = False
-    for name_variant in (failed_folder, f'"{failed_folder}"'):
+    for name_variant in (f'"{failed_folder}"', failed_folder):
         try:
             status, _ = conn.append(
                 name_variant, flags_str, date_str, raw_message
@@ -374,7 +374,8 @@ def move_message_to_failed(conn, folder_name, uid, raw_message,
 def process_folder(conn, folder_name, display_name, keys,
                    count_only, dryrun, ignore_failures, move_failures,
                    debug=False, workers=1, quiet_progress=False,
-                   on_decrypt_start=None):
+                   on_decrypt_start=None, on_scan_complete=None,
+                   on_message_decrypted=None):
     """
     Process a single folder: detect and optionally decrypt S/MIME messages.
 
@@ -382,8 +383,14 @@ def process_folder(conn, folder_name, display_name, keys,
     *workers* controls how many parallel decryption threads to use.
     *quiet_progress* suppresses per-message ``\\r`` progress output
     (used when multiple connections print simultaneously).
-    *on_decrypt_start* is an optional callback invoked when encrypted
-    messages are found and decryption is about to begin.
+    *on_decrypt_start* is an optional callback invoked with
+    ``(encrypted_count)`` when encrypted messages are found and
+    decryption is about to begin.
+    *on_scan_complete* is an optional callback invoked after the scan
+    phase with ``(total_messages, encrypted_count)`` so the caller can
+    report scan results immediately.
+    *on_message_decrypted* is an optional callback invoked after each
+    successful message decryption (for live progress tracking).
 
     Returns ``(total_messages, encrypted_count, decrypted_count,
     failed_count, error_list, elapsed_secs)``.
@@ -401,17 +408,23 @@ def process_folder(conn, folder_name, display_name, keys,
         conn, folder_name, display_name, readonly=readonly, debug=debug
     )
     if msg_count == 0:
+        if on_scan_complete is not None:
+            on_scan_complete(0, 0)
         return 0, 0, 0, 0, [], time.time() - _t0
 
     encrypted_msgs, _ = filter_encrypted(all_messages)
     encrypted_count = len(encrypted_msgs)
+
+    # Notify caller of scan results immediately
+    if on_scan_complete is not None:
+        on_scan_complete(msg_count, encrypted_count)
 
     if count_only or encrypted_count == 0:
         return msg_count, encrypted_count, 0, 0, [], time.time() - _t0
 
     # Notify caller that decryption is about to start
     if on_decrypt_start is not None:
-        on_decrypt_start()
+        on_decrypt_start(encrypted_count)
 
     # --- Fetch + Decrypt + Replace phase ---
     decrypted_count = 0
@@ -424,6 +437,7 @@ def process_folder(conn, folder_name, display_name, keys,
             conn, folder_name, encrypted_msgs, keys,
             dryrun, ignore_failures, move_failures,
             workers, dbg, quiet_progress,
+            on_message_decrypted=on_message_decrypted,
         )
     else:
         # Sequential path (original behaviour)
@@ -431,6 +445,7 @@ def process_folder(conn, folder_name, display_name, keys,
             conn, folder_name, encrypted_msgs, keys,
             dryrun, ignore_failures, move_failures,
             dbg, quiet_progress,
+            on_message_decrypted=on_message_decrypted,
         )
 
     # Expunge \Deleted messages at end of folder
@@ -451,7 +466,7 @@ def process_folder(conn, folder_name, display_name, keys,
 
 def _process_sequential(conn, folder_name, encrypted_msgs, keys,
                         dryrun, ignore_failures, move_failures, dbg,
-                        quiet_progress=False):
+                        quiet_progress=False, on_message_decrypted=None):
     """Process encrypted messages one at a time. Returns (decrypted, failed, errors)."""
     decrypted_count = 0
     failed_count = 0
@@ -516,6 +531,8 @@ def _process_sequential(conn, folder_name, encrypted_msgs, keys,
             f"{len(msg['final_message'])} bytes")
         decrypted_count += 1
         _increment_global_decrypted()
+        if on_message_decrypted is not None:
+            on_message_decrypted()
 
         if dryrun:
             if not quiet_progress:
@@ -546,7 +563,8 @@ def _process_sequential(conn, folder_name, encrypted_msgs, keys,
 
 def _process_parallel(conn, folder_name, encrypted_msgs, keys,
                       dryrun, ignore_failures, move_failures,
-                      workers, dbg, quiet_progress=False):
+                      workers, dbg, quiet_progress=False,
+                      on_message_decrypted=None):
     """
     Pipeline-parallel processing: overlap IMAP fetch/replace with
     concurrent decryption in a thread pool.
@@ -620,6 +638,8 @@ def _process_parallel(conn, folder_name, encrypted_msgs, keys,
 
         decrypted_count += 1
         _increment_global_decrypted()
+        if on_message_decrypted is not None:
+            on_message_decrypted()
         processed += 1
         elapsed = time.time() - _t0
         rate = processed / elapsed if elapsed > 0 else 0
