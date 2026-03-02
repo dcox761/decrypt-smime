@@ -8,7 +8,7 @@ Create a Python CLI tool (`decrypt-smime.py`) that connects to a Dovecot IMAP se
 
 - Emails were synced from Stalwart to local Maildir via offlineimap
 - Dovecot 2.4.2 serves the Maildir over IMAP in a Docker container
-- S/MIME encryption was applied transparently by Stalwart, causing client compatibility issues
+- Stalwart's transparent S/MIME encryption is a promising feature but some mail clients (notably iOS Mail and Outlook) do not yet fully support it
 - The existing [`list-all-flags.py`](list-all-flags.py) script provides a reference pattern for IMAP connection, folder enumeration, and flag handling
 
 ## Architecture

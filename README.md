@@ -4,14 +4,13 @@ A command-line tool that bulk-decrypts S/MIME encrypted emails on an IMAP server
 
 ## Background
 
-Stalwart mail server's transparent S/MIME encryption causes compatibility issues across common mail clients:
+Stalwart mail server has a unique and very promising feature: transparent S/MIME encryption of all stored email. It works well on **macOS Apple Mail** and reasonably well on **Thunderbird** (with minor issues such as not displaying images in encrypted messages and defaulting to send with encryption enabled). However, some mail clients do not yet fully support S/MIME:
 
-- **iOS Mail** intermittently shows "This message has not been downloaded from server" for encrypted messages, with no reliable workaround
-- **Outlook** provides no options to configure S/MIME at all
-- **Thunderbird** works but refuses to show images in encrypted messages and defaults to sending with encryption enabled
+- **iOS Mail** intermittently shows "This message has not been downloaded from server" for some encrypted messages, with no reliable workaround
+- **Outlook** does not support S/MIME without Enterprise Deployment, so there is currently no way to configure it
 - **Full-text search** and **spam filtering** break on encrypted content, and indexes cannot be rebuilt
 
-This tool was built to migrate away from server-side S/MIME encryption by decrypting all messages via a local Dovecot instance (synced from Stalwart with offlineimap) and then transferring them back.
+This tool was built to temporarily migrate away from server-side S/MIME encryption by decrypting all messages via a local Dovecot instance (synced from Stalwart with offlineimap) and then transferring them back, until client support matures.
 
 ## Features
 

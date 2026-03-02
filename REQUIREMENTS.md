@@ -2,11 +2,9 @@
 
 ## Background
 
-I have recently moved to Stalwart mail server and enabled S/MIME encryption on my account. All my emails were synced with imapsync and transparently encrypted. This has caused problems on iOS intermittently showing `This message has not been downloaded from server` for some messages which can then not be viewed at all. There are lots of possible solutions shown for this issue which do not work reliably.
+I have recently moved to Stalwart mail server and enabled its unique transparent S/MIME encryption feature on my account. All my emails were synced with imapsync and transparently encrypted. This is a very promising capability that works well on macOS Apple Mail and reasonably well on Thunderbird, with only minor issues (it refuses to show images for encrypted messages and defaults to sending with encryption enabled).
 
-Outlook does not provide options to configure S/MIME.
-
-Thunderbird works but is also not 100%. It refuses to show images for encrypted messages and always wants to send with encryption by default.
+However, iOS Mail intermittently shows `This message has not been downloaded from server` for some encrypted messages which can then not be viewed at all. There are lots of possible solutions shown for this issue which do not work reliably. Outlook does not support S/MIME without Enterprise Deployment, so there is currently no alternative client on iOS.
 
 Searching does not work very well and SPAM filtering is possibly affected. At least it is not possible to rebuild each.
 
